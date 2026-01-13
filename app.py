@@ -26,7 +26,7 @@ def save_state(state):
 state = load_state()
 
 # ================= PORTFEUILLES =================
-ETF_SIMPLE = {"VTI": 0.6, "VXUS": 0.25, "BND": 0.15}
+ETF_SIMPLE = {"VTI": 0.60, "VXUS": 0.25, "BND": 0.15}
 
 GROWTH = {
     "AAPL":0.09,"MSFT":0.09,"V":0.09,"BRK-B":0.09,"COST":0.09,
@@ -53,121 +53,165 @@ mode = st.sidebar.radio("Mode", ["Comparaison éducative","Portefeuille transact
 
 # ================= DATA =================
 tickers = list(set(
-    list(ETF_SIMPLE.keys())+
-    list(GROWTH.keys())+
-    list(RISKY.keys())+
+    list(ETF_SIMPLE.keys()) +
+    list(GROWTH.keys()) +
+    list(RISKY.keys()) +
     list(state["positions"].keys())
 ))
 
-prices = yf.download(tickers+[benchmark], start=start_date)["Adj Close"].dropna()
+@st.cache_data(show_spinner=False)
+def load_prices(tickers, benchmark, start):
+    raw = yf.download(
+        tickers + [benchmark],
+        start=start,
+        auto_adjust=True,
+        progress=False
+    )
+    prices = raw["Close"] if "Close" in raw else raw
+    prices = prices.dropna(axis=1, how="all")
+    prices = prices.dropna()
+    return prices
+
+prices = load_prices(tickers, benchmark, start_date)
+
+if prices.empty:
+    st.error("❌ Aucune donnée valide reçue de Yahoo Finance.")
+    st.stop()
 
 # ================= FUNCTIONS =================
 def simulate(weights):
     base = 100000
-    pos = {t:(base*w)/prices.iloc[0][t] for t,w in weights.items()}
+
+    valid = {t:w for t,w in weights.items() if t in prices.columns}
+    ignored = set(weights.keys()) - set(valid.keys())
+
+    if not valid:
+        st.error("❌ Aucun ticker valide pour ce portefeuille.")
+        st.stop()
+
+    if ignored:
+        st.warning(f"⚠️ Tickers ignorés (données indisponibles): {', '.join(sorted(ignored))}")
+
+    first_prices = prices.iloc[0]
+    positions = {
+        t:(base*w)/first_prices[t]
+        for t,w in valid.items()
+        if first_prices[t] > 0
+    }
+
+    values = []
     cash = 0
-    values=[]
+
     for i,d in enumerate(prices.index):
-        if i%21==0:
-            cash+=monthly
-        total=cash+sum(pos[t]*prices.loc[d,t] for t in pos)
+        if i % 21 == 0:
+            cash += monthly
+
+        total = cash + sum(
+            positions[t] * prices.loc[d, t]
+            for t in positions
+        )
         values.append(total)
-    return pd.Series(values,index=prices.index)
+
+    return pd.Series(values, index=prices.index)
 
 def cagr(series):
-    years=(series.index[-1]-series.index[0]).days/365
-    return (series.iloc[-1]/series.iloc[0])**(1/years)-1
+    years = (series.index[-1] - series.index[0]).days / 365
+    return (series.iloc[-1] / series.iloc[0])**(1/years) - 1
 
 # ================= MODE COMPARAISON =================
-if mode=="Comparaison éducative":
+if mode == "Comparaison éducative":
 
     etf = simulate(ETF_SIMPLE)
     growth = simulate(GROWTH)
     risky = simulate(RISKY)
-    bench = prices[benchmark]/prices[benchmark].iloc[0]*etf.iloc[0]
+    bench = prices[benchmark] / prices[benchmark].iloc[0] * etf.iloc[0]
 
     st.subheader("📊 Comparaison des portefeuilles")
     st.line_chart(pd.DataFrame({
-        "ETF simple":etf,
-        "Croissance":growth,
-        "Risqué":risky,
-        benchmark_name:bench
+        "ETF simple": etf,
+        "Croissance": growth,
+        "Risqué": risky,
+        benchmark_name: bench
     }))
 
     summary = pd.DataFrame({
-        "Valeur finale ($)":[etf.iloc[-1],growth.iloc[-1],risky.iloc[-1]],
-        "CAGR (%)":[cagr(etf)*100,cagr(growth)*100,cagr(risky)*100]
-    },index=["ETF simple","Croissance","Risqué"])
+        "Valeur finale ($)": [etf.iloc[-1], growth.iloc[-1], risky.iloc[-1]],
+        "CAGR (%)": [cagr(etf)*100, cagr(growth)*100, cagr(risky)*100]
+    }, index=["ETF simple","Croissance","Risqué"])
 
-    st.subheader("📈 Résumé")
-    st.dataframe(summary.style.format({"Valeur finale ($)":"{:,.0f}","CAGR (%)":"{:.2f}"}))
+    st.subheader("📈 Résumé comparatif")
+    st.dataframe(summary.style.format({
+        "Valeur finale ($)": "{:,.0f}",
+        "CAGR (%)": "{:.2f}"
+    }))
 
 # ================= MODE TRANSACTIONNEL =================
 else:
     st.subheader("🔁 Gestion des positions")
 
-    action = st.selectbox("Action",["Acheter","Vendre"])
+    action = st.selectbox("Action", ["Acheter","Vendre"])
     ticker = st.text_input("Ticker").upper()
-    shares = st.number_input("Actions",0.0)
-    price = st.number_input("Prix ($)",0.0)
+    shares = st.number_input("Nombre d’actions", min_value=0.0)
+    price = st.number_input("Prix par action ($)", min_value=0.0)
 
-    if st.button("Exécuter"):
+    if st.button("Exécuter la transaction"):
         if action=="Acheter":
-            cost=shares*price
-            if state["cash"]>=cost:
-                pos=state["positions"].get(ticker,{"shares":0,"avg":0})
-                new_sh=pos["shares"]+shares
-                pos["avg"]=(pos["shares"]*pos["avg"]+shares*price)/new_sh
-                pos["shares"]=new_sh
-                state["positions"][ticker]=pos
-                state["cash"]-=cost
+            cost = shares * price
+            if state["cash"] >= cost:
+                pos = state["positions"].get(ticker, {"shares":0,"avg":0})
+                new_shares = pos["shares"] + shares
+                pos["avg"] = (pos["shares"]*pos["avg"] + shares*price) / new_shares
+                pos["shares"] = new_shares
+                state["positions"][ticker] = pos
+                state["cash"] -= cost
         else:
-            if ticker in state["positions"] and state["positions"][ticker]["shares"]>=shares:
-                state["cash"]+=shares*price
-                state["positions"][ticker]["shares"]-=shares
-                if state["positions"][ticker]["shares"]==0:
+            if ticker in state["positions"] and state["positions"][ticker]["shares"] >= shares:
+                state["cash"] += shares * price
+                state["positions"][ticker]["shares"] -= shares
+                if state["positions"][ticker]["shares"] == 0:
                     del state["positions"][ticker]
 
         state["transactions"].append({
-            "date":str(date.today()),
-            "ticker":ticker,
-            "type":action,
-            "shares":shares,
-            "price":price
+            "date": str(date.today()),
+            "ticker": ticker,
+            "type": action,
+            "shares": shares,
+            "price": price
         })
         save_state(state)
 
-    st.metric("💰 Cash disponible",f"${state['cash']:,.0f}")
+    st.metric("💰 Cash disponible", f"${state['cash']:,.0f}")
 
-    rows=[]
+    rows = []
     for t,p in state["positions"].items():
         if t in prices.columns:
-            m=prices[t].iloc[-1]
-            val=p["shares"]*m
-            cost=p["shares"]*p["avg"]
-            pnl=val-cost
+            m = prices[t].iloc[-1]
+            val = p["shares"] * m
+            cost = p["shares"] * p["avg"]
+            pnl = val - cost
             rows.append({
-                "Ticker":t,"Actions":p["shares"],
-                "Prix moyen":round(p["avg"],2),
-                "Prix actuel":round(m,2),
-                "Valeur":round(val,2),
-                "P&L $":round(pnl,2),
-                "P&L %":round(pnl/cost*100,2)
+                "Ticker": t,
+                "Actions": p["shares"],
+                "Prix moyen": round(p["avg"],2),
+                "Prix actuel": round(m,2),
+                "Valeur": round(val,2),
+                "P&L $": round(pnl,2),
+                "P&L %": round((pnl/cost)*100,2)
             })
 
     st.subheader("📋 Positions")
     st.dataframe(pd.DataFrame(rows))
 
-    st.subheader("🧾 Historique")
+    st.subheader("🧾 Historique des transactions")
     st.dataframe(pd.DataFrame(state["transactions"]))
 
 # ================= PDF =================
 def export_pdf(title, df):
-    pdf=FPDF()
+    pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial","B",16)
     pdf.cell(0,10,title,ln=True)
-    pdf.ln(5)
+    pdf.ln(6)
     pdf.set_font("Arial",size=12)
     for _,row in df.iterrows():
         pdf.cell(0,8," | ".join(str(x) for x in row.values),ln=True)
@@ -175,16 +219,19 @@ def export_pdf(title, df):
 
 if st.button("📄 Export PDF"):
     if mode=="Comparaison éducative":
-        pdf=export_pdf("Comparaison des portefeuilles",summary)
+        pdf = export_pdf("Comparaison des portefeuilles", summary)
     else:
-        pdf=export_pdf("Portefeuille transactionnel",pd.DataFrame(state["transactions"]))
+        pdf = export_pdf("Historique des transactions", pd.DataFrame(state["transactions"]))
+
     pdf.output("rapport_trading_en_action.pdf")
-    st.download_button("⬇️ Télécharger",
+    st.download_button(
+        "⬇️ Télécharger le PDF",
         open("rapport_trading_en_action.pdf","rb"),
         file_name="rapport_trading_en_action.pdf",
         mime="application/pdf"
     )
 
+# ================= FOOTER =================
 st.markdown("""
 ---
 ### 🎓 Message clé
