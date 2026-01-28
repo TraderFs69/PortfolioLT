@@ -1,167 +1,210 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-import json, os
+import sqlite3
+import requests
+import yfinance as yf
 from datetime import date
-from fpdf import FPDF
 
-# ================= CONFIG =================
-st.set_page_config(page_title="Portefeuilles Trading en Action", layout="wide")
-st.title("📊 Portefeuilles Trading en Action")
+# ---------------- CONFIG ----------------
+DB_NAME = "portfolio.db"
+POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 
-STATE_FILE = "portfolios_state.json"
+st.set_page_config(page_title="📊 Portefeuilles Long Terme", layout="wide")
 
-# ================= STATE =================
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
+# ---------------- DB ----------------
+conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+c = conn.cursor()
 
-    return {
-        "portfolios": {
-            "ETF simple": {"cash": 100000, "positions": {}, "transactions": []},
-            "Croissance": {"cash": 100000, "positions": {}, "transactions": []},
-            "Risqué": {"cash": 100000, "positions": {}, "transactions": []}
-        }
-    }
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=4)
-
-state = load_state()
-
-# ================= SIDEBAR =================
-st.sidebar.header("⚙️ Paramètres")
-
-start_date = st.sidebar.date_input("Date de départ des graphiques", date(2018,1,1))
-
-portfolio_names = list(state["portfolios"].keys())
-selected_portfolio = st.sidebar.selectbox("Portefeuille actif", portfolio_names)
-
-view_mode = st.sidebar.radio(
-    "Vue",
-    ["Gestion du portefeuille", "Comparatif des portefeuilles"]
+c.execute("""
+CREATE TABLE IF NOT EXISTS transactions (
+    date TEXT,
+    portfolio TEXT,
+    ticker TEXT,
+    market TEXT,
+    action TEXT,
+    quantity REAL,
+    price REAL,
+    currency TEXT
 )
-
-# ================= DATA =================
-all_tickers = set()
-for p in state["portfolios"].values():
-    all_tickers.update(p["positions"].keys())
-
-@st.cache_data(show_spinner=False)
-def load_prices(tickers, start):
-    if not tickers:
-        return pd.DataFrame()
-    raw = yf.download(list(tickers), start=start, auto_adjust=True, progress=False)
-    prices = raw["Close"] if "Close" in raw else raw
-    prices = prices.dropna(axis=1, how="all").dropna()
-    return prices
-
-prices = load_prices(all_tickers, start_date)
-
-# ================= TRANSACTION MODE =================
-if view_mode == "Gestion du portefeuille":
-    pf = state["portfolios"][selected_portfolio]
-
-    st.subheader(f"📁 {selected_portfolio}")
-
-    # ----- Transactions -----
-    st.markdown("### 🔁 Nouvelle transaction")
-
-    col1, col2, col3, col4 = st.columns(4)
-    action = col1.selectbox("Action", ["Acheter", "Vendre"])
-    ticker = col2.text_input("Ticker").upper()
-    shares = col3.number_input("Actions", min_value=0.0)
-    price = col4.number_input("Prix ($)", min_value=0.0)
-
-    if st.button("Exécuter la transaction"):
-        if action == "Acheter":
-            cost = shares * price
-            if pf["cash"] >= cost:
-                pos = pf["positions"].get(ticker, {"shares":0,"avg":0})
-                new_shares = pos["shares"] + shares
-                pos["avg"] = (pos["shares"]*pos["avg"] + shares*price) / new_shares
-                pos["shares"] = new_shares
-                pf["positions"][ticker] = pos
-                pf["cash"] -= cost
-
-        else:
-            if ticker in pf["positions"] and pf["positions"][ticker]["shares"] >= shares:
-                pf["cash"] += shares * price
-                pf["positions"][ticker]["shares"] -= shares
-                if pf["positions"][ticker]["shares"] == 0:
-                    del pf["positions"][ticker]
-
-        pf["transactions"].append({
-            "date": str(date.today()),
-            "ticker": ticker,
-            "type": action,
-            "shares": shares,
-            "price": price
-        })
-        save_state(state)
-
-    st.metric("💰 Cash disponible", f"${pf['cash']:,.0f}")
-
-    # ----- Positions -----
-    st.markdown("### 📋 Positions")
-
-    rows = []
-    for t,p in pf["positions"].items():
-        if t in prices.columns:
-            m = prices[t].iloc[-1]
-            val = p["shares"] * m
-            cost = p["shares"] * p["avg"]
-            pnl = val - cost
-            rows.append({
-                "Ticker": t,
-                "Actions": p["shares"],
-                "Prix moyen": round(p["avg"],2),
-                "Prix actuel": round(m,2),
-                "Valeur": round(val,2),
-                "P&L $": round(pnl,2),
-                "P&L %": round((pnl/cost)*100,2)
-            })
-
-    st.dataframe(pd.DataFrame(rows))
-
-    st.markdown("### 🧾 Historique des transactions")
-    st.dataframe(pd.DataFrame(pf["transactions"]))
-
-# ================= COMPARISON MODE =================
-else:
-    st.subheader("📈 Comparatif des portefeuilles")
-
-    series = {}
-
-    for name,pf in state["portfolios"].items():
-        if not pf["positions"]:
-            continue
-
-        values = []
-        for d in prices.index:
-            total = pf["cash"]
-            for t,p in pf["positions"].items():
-                if t in prices.columns:
-                    total += p["shares"] * prices.loc[d,t]
-            values.append(total)
-
-        series[name] = pd.Series(values, index=prices.index)
-
-    if series:
-        st.line_chart(pd.DataFrame(series))
-    else:
-        st.info("Aucune donnée à comparer pour l’instant.")
-
-# ================= FOOTER =================
-st.markdown("""
----
-### 🎓 Philosophie Trading en Action
-Chaque portefeuille a son **objectif**,  
-son **niveau de risque**,  
-et sa **discipline propre**.
-
-👉 Ce n’est pas la performance qui compte.  
-👉 C’est la **cohérence dans le temps**.
 """)
+conn.commit()
+
+# ---------------- FX ----------------
+@st.cache_data(ttl=3600)
+def get_fx():
+    fx = yf.Ticker("USDCAD=X").history(period="1d")
+    return float(fx["Close"].iloc[-1])
+
+FX_USD_CAD = get_fx()
+
+# ---------------- PRICES ----------------
+def get_price_us(ticker):
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?apiKey={POLYGON_KEY}"
+    r = requests.get(url).json()
+    return r["results"][0]["c"] if "results" in r else None
+
+def get_price_ca(ticker):
+    data = yf.Ticker(ticker).history(period="1d")
+    return float(data["Close"].iloc[-1])
+
+def get_live_price(ticker, market):
+    return get_price_us(ticker) if market == "US" else get_price_ca(ticker)
+
+# ---------------- TRANSACTIONS ----------------
+def add_transaction(d, portfolio, ticker, market, action, qty, price, currency):
+    c.execute(
+        "INSERT INTO transactions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (d, portfolio, ticker, market, action, qty, price, currency)
+    )
+    conn.commit()
+
+# ---------------- CASH ----------------
+def get_cash(portfolio):
+    df = pd.read_sql(
+        f"SELECT * FROM transactions WHERE portfolio='{portfolio}' AND action LIKE 'CASH%'",
+        conn
+    )
+    if df.empty:
+        return {"CAD": 0.0, "USD": 0.0}
+
+    df["signed"] = df.apply(
+        lambda x: x["quantity"] if x["action"] == "CASH_DEPOSIT" else -x["quantity"],
+        axis=1
+    )
+    return df.groupby("currency")["signed"].sum().to_dict()
+
+# ---------------- POSITIONS ----------------
+def load_positions(portfolio):
+    df = pd.read_sql(
+        f"SELECT * FROM transactions WHERE portfolio='{portfolio}' AND action IN ('BUY','SELL')",
+        conn
+    )
+    if df.empty:
+        return pd.DataFrame()
+
+    df["signed_qty"] = df.apply(
+        lambda x: x["quantity"] if x["action"] == "BUY" else -x["quantity"],
+        axis=1
+    )
+
+    pos = df.groupby(["ticker", "market", "currency"]).agg(
+        quantity=("signed_qty", "sum"),
+        avg_price=("price", "mean")
+    ).reset_index()
+
+    return pos[pos["quantity"] > 0]
+
+# ---------------- UI ----------------
+st.title("📊 Gestionnaire de Portefeuilles (Persistant)")
+
+portfolio = st.selectbox("📁 Portefeuille", ["ETF", "CROISSANCE", "RISQUE"])
+
+# ---------------- CASH UI ----------------
+st.subheader("💰 Gestion du cash")
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    cash_action = st.selectbox("Action", ["CASH_DEPOSIT", "CASH_WITHDRAW"])
+with col2:
+    cash_amount = st.number_input("Montant", min_value=0.0)
+with col3:
+    cash_currency = st.selectbox("Devise", ["CAD", "USD"])
+
+if st.button("💾 Enregistrer cash"):
+    add_transaction(
+        date.today().strftime("%Y-%m-%d"),
+        portfolio,
+        "CASH",
+        "N/A",
+        cash_action,
+        cash_amount,
+        1,
+        cash_currency
+    )
+    st.success("Cash enregistré")
+
+cash = get_cash(portfolio)
+st.info(f"💵 Cash CAD: {cash.get('CAD',0):.2f} | 💲 Cash USD: {cash.get('USD',0):.2f}")
+
+# ---------------- TRADE UI ----------------
+st.subheader("➕ Achat / Vente")
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    ticker = st.text_input("Ticker (AAPL / CNQ.TO)")
+    market = st.selectbox("Marché", ["US", "CA"])
+with c2:
+    action = st.selectbox("Action", ["BUY", "SELL"])
+    qty = st.number_input("Quantité", min_value=0.0)
+with c3:
+    price = st.number_input("Prix", min_value=0.0)
+    trans_date = st.date_input("Date", value=date.today())
+
+currency = "USD" if market == "US" else "CAD"
+
+if st.button("💾 Enregistrer trade"):
+    add_transaction(
+        trans_date.strftime("%Y-%m-%d"),
+        portfolio,
+        ticker.upper(),
+        market,
+        action,
+        qty,
+        price,
+        currency
+    )
+
+    # impact cash
+    cash_flow = qty * price
+    cash_action = "CASH_WITHDRAW" if action == "BUY" else "CASH_DEPOSIT"
+    add_transaction(
+        trans_date.strftime("%Y-%m-%d"),
+        portfolio,
+        "CASH",
+        "N/A",
+        cash_action,
+        cash_flow,
+        1,
+        currency
+    )
+    st.success("Trade enregistré")
+
+# ---------------- PORTFOLIO VIEW ----------------
+st.divider()
+st.subheader(f"📈 Positions – {portfolio}")
+
+pos = load_positions(portfolio)
+
+if pos.empty:
+    st.info("Aucune position")
+else:
+    rows = []
+    for _, r in pos.iterrows():
+        live = get_live_price(r.ticker, r.market)
+        value = live * r.quantity
+        cost = r.avg_price * r.quantity
+        value_cad = value if r.currency == "CAD" else value * FX_USD_CAD
+
+        rows.append({
+            "Ticker": r.ticker,
+            "Qté": r.quantity,
+            "Devise": r.currency,
+            "Prix moyen": r.avg_price,
+            "Prix actuel": live,
+            "Valeur CAD": value_cad,
+            "Gain CAD": value_cad - (cost if r.currency == "CAD" else cost * FX_USD_CAD)
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df.style.format({
+        "Prix moyen": "{:.2f}",
+        "Prix actuel": "{:.2f}",
+        "Valeur CAD": "{:.2f}",
+        "Gain CAD": "{:.2f}"
+    }))
+
+# ---------------- JOURNAL ----------------
+st.divider()
+st.subheader("📒 Journal de transactions (permanent)")
+journal = pd.read_sql("SELECT * FROM transactions ORDER BY date DESC", conn)
+st.dataframe(journal)
