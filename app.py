@@ -30,13 +30,11 @@ CREATE TABLE IF NOT EXISTS transactions (
 """)
 conn.commit()
 
-# ---- MIGRATION SAFE (ancienne table) ----
+# ---- MIGRATION SAFE ----
 def migrate_db():
     cols = [row[1] for row in c.execute("PRAGMA table_info(transactions)").fetchall()]
-
     if "currency" not in cols:
         c.execute("ALTER TABLE transactions ADD COLUMN currency TEXT DEFAULT 'CAD'")
-
     conn.commit()
 
 migrate_db()
@@ -96,12 +94,13 @@ def delete_tx(rowid):
 # ================= CASH =================
 def get_cash(portfolio):
     df = pd.read_sql(
-        f"""
+        """
         SELECT * FROM transactions
-        WHERE portfolio='{portfolio}'
+        WHERE portfolio = ?
         AND action IN ('CASH_DEPOSIT','CASH_WITHDRAW','DIVIDEND')
         """,
-        conn
+        conn,
+        params=(portfolio,)
     )
 
     if df.empty:
@@ -111,18 +110,18 @@ def get_cash(portfolio):
         lambda x: x["quantity"] if x["action"] in ("CASH_DEPOSIT","DIVIDEND") else -x["quantity"],
         axis=1
     )
-
     return df.groupby("currency")["signed"].sum().to_dict()
 
 # ================= POSITIONS =================
 def load_positions(portfolio):
     df = pd.read_sql(
-        f"""
+        """
         SELECT * FROM transactions
-        WHERE portfolio='{portfolio}'
+        WHERE portfolio = ?
         AND action IN ('BUY','SELL')
         """,
-        conn
+        conn,
+        params=(portfolio,)
     )
 
     if df.empty:
@@ -201,7 +200,6 @@ with t1:
     price_mode = st.selectbox("Prix de référence", ["Open","Close","VWAP"])
 
 with t2:
-    target_amount = st.number_input("💰 Montant ($)", min_value=0.0)
     risk_pct = st.number_input("⚠️ Risk % portefeuille", min_value=0.0, max_value=10.0, value=1.0)
 
 with t3:
@@ -231,19 +229,17 @@ portfolio_val = portfolio_value(portfolio)
 colA, colB = st.columns(2)
 
 with colA:
-    if st.button("⚡ Auto-prix"):
-        if ref_price:
-            st.session_state.price = round(ref_price, 2)
+    if st.button("⚡ Auto-prix") and ref_price:
+        st.session_state.price = round(ref_price, 2)
 
 with colB:
-    if st.button("🧮 Taille auto (Risk %)"):
-        if ref_price and portfolio_val > 0:
-            risk_dollars = portfolio_val * (risk_pct / 100)
-            stop_distance = ref_price * (stop_pct / 100)
-            qty = risk_dollars / stop_distance
-            qty = int(qty) if rounding == "Entier" else round(qty, 2)
-            st.session_state.qty = qty
-            st.session_state.price = round(ref_price, 2)
+    if st.button("🧮 Taille auto (Risk %)") and ref_price and portfolio_val > 0:
+        risk_dollars = portfolio_val * (risk_pct / 100)
+        stop_distance = ref_price * (stop_pct / 100)
+        qty = risk_dollars / stop_distance
+        qty = int(qty) if rounding == "Entier" else round(qty, 2)
+        st.session_state.qty = qty
+        st.session_state.price = round(ref_price, 2)
 
 price = st.number_input("Prix exécuté", min_value=0.0, key="price")
 qty = st.number_input("Quantité", min_value=0.0, key="qty")
@@ -265,10 +261,27 @@ st.metric("Valeur totale (CAD)", f"{portfolio_value(portfolio):,.2f}")
 st.divider()
 st.subheader("📒 Journal de transactions")
 
-journal = pd.read_sql("SELECT rowid,* FROM transactions ORDER BY date DESC", conn)
+journal = pd.read_sql(
+    """
+    SELECT
+        rowid AS tx_id,
+        date,
+        portfolio,
+        ticker,
+        market,
+        action,
+        quantity,
+        price,
+        currency
+    FROM transactions
+    ORDER BY date DESC
+    """,
+    conn
+)
+
 st.dataframe(journal)
 
-tx_id = st.number_input("rowid à supprimer", min_value=1, step=1)
+tx_id = st.number_input("tx_id à supprimer", min_value=1, step=1)
 if st.button("🗑️ Supprimer transaction"):
     delete_tx(tx_id)
     st.warning("Transaction supprimée")
