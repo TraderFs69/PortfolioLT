@@ -3,7 +3,7 @@ import pandas as pd
 import sqlite3
 import requests
 import yfinance as yf
-from datetime import date
+from datetime import date, timedelta
 
 # ================= CONFIG =================
 DB_NAME = "portfolio.db"
@@ -39,17 +39,35 @@ def get_fx():
 FX = get_fx()
 
 # ================= PRICES =================
-def get_price_us(ticker):
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?apiKey={POLYGON_KEY}"
+def get_ohlc_us(ticker, d):
+    ds = d.strftime("%Y-%m-%d")
+    url = f"https://api.polygon.io/v1/open-close/{ticker}/{ds}?adjusted=true&apiKey={POLYGON_KEY}"
     r = requests.get(url).json()
-    return r["results"][0]["c"] if "results" in r else None
+    if r.get("status") != "OK":
+        return None
+    return {
+        "Open": r["open"],
+        "High": r["high"],
+        "Low": r["low"],
+        "Close": r["close"],
+        "VWAP": r.get("vwap")
+    }
 
-def get_price_ca(ticker):
-    data = yf.Ticker(ticker).history(period="1d")
-    return float(data["Close"].iloc[-1])
+def get_ohlc_ca(ticker, d):
+    df = yf.Ticker(ticker).history(start=d, end=d + timedelta(days=1))
+    if df.empty:
+        return None
+    row = df.iloc[0]
+    return {
+        "Open": float(row["Open"]),
+        "High": float(row["High"]),
+        "Low": float(row["Low"]),
+        "Close": float(row["Close"]),
+        "VWAP": float((row["High"] + row["Low"] + row["Close"]) / 3)
+    }
 
-def get_live_price(ticker, market):
-    return get_price_us(ticker) if market == "US" else get_price_ca(ticker)
+def get_ohlc(ticker, market, d):
+    return get_ohlc_us(ticker, d) if market == "US" else get_ohlc_ca(ticker, d)
 
 # ================= TRANSACTIONS =================
 def add_tx(d, portfolio, ticker, market, action, qty, price, currency):
@@ -66,14 +84,18 @@ def delete_tx(tx_id):
 # ================= CASH =================
 def get_cash(portfolio):
     df = pd.read_sql(
-        f"SELECT * FROM transactions WHERE portfolio='{portfolio}' AND action IN ('CASH_DEPOSIT','CASH_WITHDRAW','DIVIDEND')",
+        f"""
+        SELECT * FROM transactions 
+        WHERE portfolio='{portfolio}' 
+        AND action IN ('CASH_DEPOSIT','CASH_WITHDRAW','DIVIDEND')
+        """,
         conn
     )
     if df.empty:
-        return {"CAD": 0, "USD": 0}
+        return {"CAD": 0.0, "USD": 0.0}
 
     df["signed"] = df.apply(
-        lambda x: x["quantity"] if x["action"] in ("CASH_DEPOSIT", "DIVIDEND") else -x["quantity"],
+        lambda x: x["quantity"] if x["action"] in ("CASH_DEPOSIT","DIVIDEND") else -x["quantity"],
         axis=1
     )
     return df.groupby("currency")["signed"].sum().to_dict()
@@ -81,14 +103,18 @@ def get_cash(portfolio):
 # ================= POSITIONS =================
 def load_positions(portfolio):
     df = pd.read_sql(
-        f"SELECT * FROM transactions WHERE portfolio='{portfolio}' AND action IN ('BUY','SELL')",
+        f"""
+        SELECT * FROM transactions 
+        WHERE portfolio='{portfolio}' 
+        AND action IN ('BUY','SELL')
+        """,
         conn
     )
     if df.empty:
         return pd.DataFrame()
 
     df["signed_qty"] = df.apply(
-        lambda x: x["quantity"] if x["action"] == "BUY" else -x["quantity"],
+        lambda x: x["quantity"] if x["action"]=="BUY" else -x["quantity"],
         axis=1
     )
 
@@ -99,7 +125,7 @@ def load_positions(portfolio):
 
     return pos[pos["quantity"] > 0]
 
-# ================= PERFORMANCE =================
+# ================= PORTFOLIO VALUE =================
 def portfolio_value(portfolio):
     pos = load_positions(portfolio)
     cash = get_cash(portfolio)
@@ -107,8 +133,11 @@ def portfolio_value(portfolio):
     total = cash.get("CAD",0) + cash.get("USD",0) * FX
 
     for _, r in pos.iterrows():
-        live = get_live_price(r.ticker, r.market)
-        val = live * r.quantity
+        ohlc = get_ohlc(r.ticker, r.market, date.today())
+        if not ohlc:
+            continue
+        price = ohlc["Close"]
+        val = price * r.quantity
         total += val if r.currency=="CAD" else val * FX
 
     return total
@@ -118,7 +147,7 @@ st.title("📊 Portfolio Tracker Pro")
 
 portfolio = st.selectbox("📁 Portefeuille", ["ETF","CROISSANCE","RISQUE"])
 
-# -------- CASH --------
+# -------- CASH / DIVIDENDES --------
 st.subheader("💰 Cash & Dividendes")
 
 c1,c2,c3 = st.columns(3)
@@ -143,81 +172,88 @@ if st.button("💾 Enregistrer cash/dividende"):
     st.success("Enregistré")
 
 cash = get_cash(portfolio)
-st.info(f"Cash CAD: {cash.get('CAD',0):.2f} | Cash USD: {cash.get('USD',0):.2f}")
+st.info(f"💵 Cash CAD : {cash.get('CAD',0):.2f} | 💲 Cash USD : {cash.get('USD',0):.2f}")
 
-# -------- TRADE --------
-st.subheader("➕ Achat / Vente")
+# -------- TICKET DE TRADE --------
+st.divider()
+st.subheader("➕ Ticket de trade avancé")
 
-t1,t2,t3 = st.columns(3)
+t1,t2,t3,t4 = st.columns([2,2,2,4])
+
 with t1:
-    ticker = st.text_input("Ticker")
-    market = st.selectbox("Marché", ["US","CA"])
+    ticker = st.text_input("Ticker", key="ticker")
+    market = st.selectbox("Marché", ["US","CA"], key="market")
+    price_mode = st.selectbox("Prix de référence", ["Open","Close","VWAP"])
+
 with t2:
-    action = st.selectbox("Action", ["BUY","SELL"])
-    qty = st.number_input("Quantité", min_value=0.0)
+    target_amount = st.number_input("💰 Montant ($)", min_value=0.0)
+    risk_pct = st.number_input("⚠️ Risk % portefeuille", min_value=0.0, max_value=10.0, value=1.0)
+
 with t3:
-    price = st.number_input("Prix", min_value=0.0)
+    stop_pct = st.number_input("📉 Stop (%)", min_value=0.0, value=5.0)
+    rounding = st.selectbox("Arrondi quantité", ["Entier","2 décimales"])
+
+with t4:
     tx_date = st.date_input("Date", value=date.today())
+
+ohlc = get_ohlc(ticker.upper(), market, tx_date) if ticker else None
+
+if ohlc:
+    st.markdown(
+        f"""
+        **📊 OHLC**
+        - Open : **{ohlc['Open']:.2f}**
+        - High : **{ohlc['High']:.2f}**
+        - Low : **{ohlc['Low']:.2f}**
+        - Close : **{ohlc['Close']:.2f}**
+        - VWAP : **{ohlc['VWAP']:.2f}**
+        """
+    )
+
+ref_price = ohlc[price_mode] if ohlc else None
+portfolio_val = portfolio_value(portfolio)
+
+colA, colB = st.columns(2)
+
+with colA:
+    if st.button("⚡ Auto-prix"):
+        if ref_price:
+            st.session_state.price = round(ref_price,2)
+
+with colB:
+    if st.button("🧮 Taille auto (Risk %)"):
+        if ref_price and portfolio_val > 0:
+            risk_dollars = portfolio_val * (risk_pct / 100)
+            stop_distance = ref_price * (stop_pct / 100)
+            qty = risk_dollars / stop_distance
+            qty = int(qty) if rounding=="Entier" else round(qty,2)
+            st.session_state.qty = qty
+            st.session_state.price = round(ref_price,2)
+
+price = st.number_input("Prix exécuté", min_value=0.0, key="price")
+qty = st.number_input("Quantité", min_value=0.0, key="qty")
 
 currency = "USD" if market=="US" else "CAD"
 
 if st.button("💾 Enregistrer trade"):
-    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, ticker.upper(), market, action, qty, price, currency)
-
-  
-
-    cash_flow = qty * price
-    add_tx(
-        tx_date.strftime("%Y-%m-%d"),
-        portfolio,
-        "CASH",
-        "N/A",
-        "CASH_WITHDRAW" if action=="BUY" else "CASH_DEPOSIT",
-        cash_flow,
-        1,
-        currency
-    )
+    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, ticker.upper(), market, "BUY", qty, price, currency)
+    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, "CASH", "N/A", "CASH_WITHDRAW", qty*price, 1, currency)
     st.success("Trade enregistré")
-
-# -------- POSITIONS --------
-st.divider()
-st.subheader("📈 Positions")
-
-pos = load_positions(portfolio)
-rows = []
-
-for _, r in pos.iterrows():
-    live = get_live_price(r.ticker, r.market)
-    val = live * r.quantity
-    val_cad = val if r.currency=="CAD" else val * FX
-    cost = r.avg_price * r.quantity
-    cost_cad = cost if r.currency=="CAD" else cost * FX
-
-    rows.append({
-        "Ticker": r.ticker,
-        "Qté": r.quantity,
-        "Valeur CAD": val_cad,
-        "Gain CAD": val_cad - cost_cad
-    })
-
-df_pos = pd.DataFrame(rows)
-st.dataframe(df_pos.style.format({"Valeur CAD":"{:.2f}","Gain CAD":"{:.2f}"}))
 
 # -------- PERFORMANCE --------
 st.divider()
 st.subheader("📊 Performance globale")
 
-total_value = portfolio_value(portfolio)
-st.metric("Valeur totale (CAD)", f"{total_value:,.2f}")
+st.metric("Valeur totale (CAD)", f"{portfolio_value(portfolio):,.2f}")
 
 # -------- JOURNAL --------
 st.divider()
-st.subheader("📒 Journal (modifiable)")
+st.subheader("📒 Journal de transactions")
 
 journal = pd.read_sql("SELECT * FROM transactions ORDER BY date DESC", conn)
 st.dataframe(journal)
 
-tx_id = st.number_input("ID de la transaction à supprimer", min_value=1, step=1)
-if st.button("🗑️ Supprimer la transaction"):
+tx_id = st.number_input("ID à supprimer", min_value=1, step=1)
+if st.button("🗑️ Supprimer transaction"):
     delete_tx(tx_id)
     st.warning("Transaction supprimée")
