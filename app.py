@@ -4,6 +4,7 @@ import sqlite3
 import yfinance as yf
 import requests
 from datetime import date, timedelta
+import numpy as np
 
 # ================= CONFIG =================
 DB_NAME = "portfolio.db"
@@ -41,7 +42,7 @@ def fx_rate():
 
 FX = fx_rate()
 
-# ================= OHLC (date choisie) =================
+# ================= OHLC =================
 def get_ohlc(ticker, market, d):
     if market == "US":
         url = f"https://api.polygon.io/v1/open-close/{ticker}/{d}?adjusted=true&apiKey={POLYGON_KEY}"
@@ -70,15 +71,7 @@ def get_last_close_us(ticker):
 def get_last_closes_ca(tickers):
     if not tickers:
         return {}
-
-    data = yf.download(
-        tickers=tickers,
-        period="5d",
-        group_by="ticker",
-        auto_adjust=False,
-        progress=False
-    )
-
+    data = yf.download(tickers, period="5d", group_by="ticker", progress=False)
     prices = {}
     for t in tickers:
         try:
@@ -88,20 +81,7 @@ def get_last_closes_ca(tickers):
                 prices[t] = float(data[t]["Close"].dropna().iloc[-1])
         except Exception:
             prices[t] = None
-
     return prices
-
-# ================= TRANSACTIONS =================
-def add_tx(d, portfolio, ticker, market, action, qty, price, currency):
-    c.execute(
-        "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?)",
-        (d, portfolio, ticker, market, action, qty, price, currency)
-    )
-    conn.commit()
-
-def delete_tx(rowid):
-    c.execute("DELETE FROM transactions WHERE rowid=?", (rowid,))
-    conn.commit()
 
 # ================= POSITIONS =================
 def load_positions(portfolio):
@@ -110,12 +90,9 @@ def load_positions(portfolio):
         conn, params=(portfolio,)
     )
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
-    df["signed"] = df.apply(
-        lambda x: x["quantity"] if x["action"] == "BUY" else -x["quantity"],
-        axis=1
-    )
+    df["signed"] = np.where(df["action"]=="BUY", df["quantity"], -df["quantity"])
 
     pos = df.groupby(["ticker","market","currency"]).agg(
         quantity=("signed","sum"),
@@ -124,11 +101,10 @@ def load_positions(portfolio):
 
     pos = pos[pos["quantity"] > 0]
 
-    ca_tickers = pos[pos["market"]=="CA"]["ticker"].unique().tolist()
+    ca_tickers = pos[pos["market"]=="CA"]["ticker"].tolist()
     ca_prices = get_last_closes_ca(ca_tickers)
 
-    prices = []
-    values = []
+    prices, values, costs = [], [], []
 
     for _, r in pos.iterrows():
         if r.market == "CA":
@@ -139,23 +115,40 @@ def load_positions(portfolio):
         prices.append(price)
 
         if price is not None:
-            v = price * r.quantity
-            values.append(v if r.currency=="CAD" else v * FX)
+            val = price * r.quantity
+            val_cad = val if r.currency=="CAD" else val * FX
+            cost = r.avg_price * r.quantity
+            cost_cad = cost if r.currency=="CAD" else cost * FX
         else:
-            values.append(None)
+            val_cad, cost_cad = None, None
+
+        values.append(val_cad)
+        costs.append(cost_cad)
 
     pos["Prix actuel"] = prices
     pos["Valeur (CAD)"] = values
-    pos["Gain %"] = (pos["Prix actuel"] - pos["avg_price"]) / pos["avg_price"] * 100
+    pos["Coût (CAD)"] = costs
+    pos["Gain %"] = (pos["Valeur (CAD)"] - pos["Coût (CAD)"]) / pos["Coût (CAD)"] * 100
 
-    return pos
+    return pos, df
+
+# ================= METRICS =================
+def portfolio_metrics(pos, df):
+    total_value = pos["Valeur (CAD)"].sum()
+    total_cost = pos["Coût (CAD)"].sum()
+    total_return = (total_value / total_cost - 1) * 100 if total_cost > 0 else 0
+
+    start_date = pd.to_datetime(df["date"]).min()
+    years = (pd.Timestamp.today() - start_date).days / 365.25
+    cagr = (total_value / total_cost) ** (1/years) - 1 if years > 0 else 0
+
+    return total_value, total_return, cagr
 
 # ================= UI =================
 st.title("📊 Portfolio Tracker")
 
 portfolio = st.selectbox("📁 Portefeuille", ["ETF","CROISSANCE","RISQUE"])
 
-# ---------- ACHAT / VENTE ----------
 st.subheader("➕ Achat / Vente")
 
 c1, c2, c3 = st.columns(3)
@@ -186,26 +179,40 @@ if st.button("⚡ Calculer quantité") and ref_price and montant > 0:
 
 price = st.number_input("Prix exécuté", key="price")
 qty = st.number_input("Quantité", key="qty")
-
 currency = "USD" if market == "US" else "CAD"
 
 if st.button("💾 Enregistrer"):
-    add_tx(
-        tx_date.strftime("%Y-%m-%d"),
-        portfolio,
-        normalize_ticker(ticker, market),
-        market,
-        "BUY",
-        qty,
-        price,
-        currency
+    c.execute(
+        "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?)",
+        (tx_date.strftime("%Y-%m-%d"), portfolio, normalize_ticker(ticker, market),
+         market, "BUY", qty, price, currency)
     )
+    conn.commit()
     st.success("Transaction enregistrée")
 
 # ---------- COMPOSITION ----------
 st.divider()
 st.subheader(f"📦 Composition {portfolio}")
-st.dataframe(load_positions(portfolio))
+
+pos, df_port = load_positions(portfolio)
+
+if not pos.empty:
+    total_value, total_return, cagr = portfolio_metrics(pos, df_port)
+
+    st.metric("Valeur totale (CAD)", f"{total_value:,.2f}")
+    st.metric("Rendement total", f"{total_return:.2f} %")
+    st.metric("CAGR", f"{cagr*100:.2f} %")
+
+    st.dataframe(
+        pos.style.format({
+            "Prix actuel": "{:.2f}",
+            "Valeur (CAD)": "{:,.2f}",
+            "Coût (CAD)": "{:,.2f}",
+            "Gain %": "{:.2f}%"
+        })
+    )
+else:
+    st.info("Aucune position dans ce portefeuille.")
 
 # ---------- JOURNAL ----------
 st.divider()
@@ -213,16 +220,8 @@ st.subheader("📒 Journal des transactions")
 
 journal = pd.read_sql(
     """
-    SELECT
-        rowid AS tx_id,
-        date,
-        portfolio,
-        ticker,
-        market,
-        action,
-        quantity,
-        price,
-        currency
+    SELECT rowid AS tx_id, date, portfolio, ticker, market, action,
+           quantity, price, currency
     FROM transactions
     ORDER BY date DESC
     """,
@@ -230,8 +229,3 @@ journal = pd.read_sql(
 )
 
 st.dataframe(journal)
-
-tx_id = st.number_input("tx_id à supprimer", min_value=1, step=1)
-if st.button("🗑️ Supprimer transaction"):
-    delete_tx(tx_id)
-    st.warning("Transaction supprimée")
