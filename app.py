@@ -4,6 +4,7 @@ import sqlite3
 import requests
 import yfinance as yf
 from datetime import date, timedelta
+import numpy as np
 
 # ================= CONFIG =================
 DB_NAME = "portfolio.db"
@@ -59,27 +60,14 @@ def get_ohlc_us(ticker, d):
     r = requests.get(url).json()
     if r.get("status") != "OK":
         return None
-    return {
-        "Open": r["open"],
-        "High": r["high"],
-        "Low": r["low"],
-        "Close": r["close"],
-        "VWAP": r.get("vwap")
-    }
+    return {"Close": r["close"]}
 
 def get_ohlc_ca(ticker, d):
     ticker = normalize_ticker(ticker, "CA")
     df = yf.Ticker(ticker).history(start=d, end=d + timedelta(days=1))
     if df.empty:
         return None
-    row = df.iloc[0]
-    return {
-        "Open": float(row["Open"]),
-        "High": float(row["High"]),
-        "Low": float(row["Low"]),
-        "Close": float(row["Close"]),
-        "VWAP": None
-    }
+    return {"Close": float(df.iloc[0]["Close"])}
 
 def get_ohlc(ticker, market, d):
     return get_ohlc_us(ticker, d) if market == "US" else get_ohlc_ca(ticker, d)
@@ -147,138 +135,101 @@ def load_positions(portfolio):
     return pos[pos["quantity"] > 0]
 
 # ================= PORTFOLIO VALUE =================
-def portfolio_value(portfolio):
-    pos = load_positions(portfolio)
-    cash = get_cash(portfolio)
+def portfolio_value_at_date(portfolio, d):
+    df = pd.read_sql(
+        "SELECT * FROM transactions WHERE portfolio = ? AND date <= ?",
+        conn,
+        params=(portfolio, d.strftime("%Y-%m-%d"))
+    )
 
-    total = cash.get("CAD",0) + cash.get("USD",0) * FX
+    cash = {"CAD": 0.0, "USD": 0.0}
+    positions = {}
 
-    for _, r in pos.iterrows():
-        ohlc = get_ohlc(r.ticker, r.market, date.today())
+    for _, r in df.iterrows():
+        if r["action"] == "CASH_DEPOSIT":
+            cash[r["currency"]] += r["quantity"]
+        elif r["action"] == "CASH_WITHDRAW":
+            cash[r["currency"]] -= r["quantity"]
+        elif r["action"] == "BUY":
+            positions.setdefault((r["ticker"], r["market"], r["currency"]), 0)
+            positions[(r["ticker"], r["market"], r["currency"])] += r["quantity"]
+        elif r["action"] == "SELL":
+            positions.setdefault((r["ticker"], r["market"], r["currency"]), 0)
+            positions[(r["ticker"], r["market"], r["currency"])] -= r["quantity"]
+
+    total = cash["CAD"] + cash["USD"] * FX
+
+    for (ticker, market, currency), qty in positions.items():
+        if qty <= 0:
+            continue
+        ohlc = get_ohlc(ticker, market, d)
         if not ohlc:
             continue
-        price = ohlc["Close"]
-        val = price * r.quantity
-        total += val if r.currency == "CAD" else val * FX
+        value = ohlc["Close"] * qty
+        total += value if currency == "CAD" else value * FX
 
     return total
+
+def portfolio_timeseries(portfolio):
+    df = pd.read_sql(
+        "SELECT MIN(date) as start, MAX(date) as end FROM transactions WHERE portfolio = ?",
+        conn,
+        params=(portfolio,)
+    )
+
+    if df.iloc[0]["start"] is None:
+        return pd.DataFrame()
+
+    dates = pd.date_range(df.iloc[0]["start"], df.iloc[0]["end"], freq="D")
+    return pd.DataFrame({
+        "Date": dates,
+        "Valeur": [portfolio_value_at_date(portfolio, d) for d in dates]
+    })
+
+# ================= BENCHMARK =================
+@st.cache_data(ttl=3600)
+def benchmark_series(symbol, start, end):
+    df = yf.Ticker(symbol).history(start=start, end=end)
+    if df.empty:
+        return pd.DataFrame()
+    df = df.reset_index()[["Date", "Close"]]
+    df["Valeur"] = df["Close"] / df["Close"].iloc[0] * 100
+    return df[["Date", "Valeur"]]
 
 # ================= UI =================
 st.title("📊 Portfolio Tracker")
 
-portfolio = st.selectbox("📁 Portefeuille", ["ETF","CROISSANCE","RISQUE"])
+st.subheader("📈 Évolution comparée + Benchmark")
 
-# -------- CASH --------
-st.subheader("💰 Cash")
+series = []
+start_dates = []
 
-c1,c2,c3 = st.columns(3)
-with c1:
-    cash_action = st.selectbox("Action", ["CASH_DEPOSIT","CASH_WITHDRAW","DIVIDEND"])
-with c2:
-    cash_amount = st.number_input("Montant", min_value=0.0)
-with c3:
-    cash_currency = st.selectbox("Devise", ["CAD","USD"])
+for p in ["ETF","CROISSANCE","RISQUE"]:
+    ts = portfolio_timeseries(p)
+    if not ts.empty:
+        ts["Valeur"] = ts["Valeur"] / ts["Valeur"].iloc[0] * 100
+        ts["Label"] = p
+        series.append(ts)
+        start_dates.append(ts["Date"].min())
 
-if st.button("💾 Enregistrer cash"):
-    add_tx(
-        date.today().strftime("%Y-%m-%d"),
-        portfolio,
-        "CASH",
-        "N/A",
-        cash_action,
-        cash_amount,
-        1,
-        cash_currency
-    )
-    st.success("Cash enregistré")
+if series:
+    start = min(start_dates)
+    end = date.today()
 
-cash = get_cash(portfolio)
-st.info(f"💵 Cash CAD : {cash.get('CAD',0):.2f} | 💲 Cash USD : {cash.get('USD',0):.2f}")
+    sp500 = benchmark_series("^GSPC", start, end)
+    tsx = benchmark_series("^GSPTSE", start, end)
 
-# -------- TRADE --------
-st.divider()
-st.subheader("➕ Achat / Vente")
+    if not sp500.empty:
+        sp500["Label"] = "S&P 500"
+        series.append(sp500)
 
-t1,t2,t3,t4 = st.columns([2,2,2,4])
+    if not tsx.empty:
+        tsx["Label"] = "TSX Composite"
+        series.append(tsx)
 
-with t1:
-    ticker = st.text_input("Ticker (ex: XUU, CNQ)")
-    market = st.selectbox("Marché", ["US","CA"])
-    price_mode = st.selectbox("Prix de référence", ["Open","Close","VWAP"])
+    df_all = pd.concat(series)
+    chart_df = df_all.pivot(index="Date", columns="Label", values="Valeur")
 
-with t2:
-    target_amount = st.number_input("💰 Montant désiré", min_value=0.0)
-
-with t3:
-    tx_date = st.date_input("Date", value=date.today())
-    rounding = st.selectbox("Arrondi quantité", ["Entier","2 décimales"])
-
-with t4:
-    ohlc = get_ohlc(ticker, market, tx_date) if ticker else None
-    st.markdown("**📊 OHLC**")
-    if ohlc:
-        st.markdown(
-            f"""
-            Open : **{ohlc['Open']:.2f}**  
-            High : **{ohlc['High']:.2f}**  
-            Low : **{ohlc['Low']:.2f}**  
-            Close : **{ohlc['Close']:.2f}**
-            """
-        )
-    else:
-        st.caption("Aucune donnée disponible")
-
-ref_price = ohlc.get(price_mode) if ohlc else None
-
-if st.button("⚡ Auto-prix") and ref_price:
-    st.session_state.price = round(ref_price,2)
-
-if st.button("🧮 Calculer quantité") and ref_price and target_amount > 0:
-    qty = target_amount / ref_price
-    qty = int(qty) if rounding=="Entier" else round(qty,2)
-    st.session_state.qty = qty
-    st.session_state.price = round(ref_price,2)
-
-price = st.number_input("Prix exécuté", min_value=0.0, key="price")
-qty = st.number_input("Quantité", min_value=0.0, key="qty")
-
-currency = "USD" if market=="US" else "CAD"
-
-if st.button("💾 Enregistrer trade"):
-    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, ticker, market, "BUY", qty, price, currency)
-    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, "CASH", "N/A", "CASH_WITHDRAW", qty*price, 1, currency)
-    st.success("Trade enregistré")
-
-# -------- PERFORMANCE --------
-st.divider()
-st.subheader("📊 Performance globale")
-st.metric("Valeur totale (CAD)", f"{portfolio_value(portfolio):,.2f}")
-
-# -------- JOURNAL --------
-st.divider()
-st.subheader("📒 Journal de transactions")
-
-journal = pd.read_sql(
-    """
-    SELECT
-        rowid AS tx_id,
-        date,
-        portfolio,
-        ticker,
-        market,
-        action,
-        quantity,
-        price,
-        currency
-    FROM transactions
-    ORDER BY date DESC
-    """,
-    conn
-)
-
-st.dataframe(journal)
-
-tx_id = st.number_input("tx_id à supprimer", min_value=1, step=1)
-if st.button("🗑️ Supprimer transaction"):
-    delete_tx(tx_id)
-    st.warning("Transaction supprimée")
+    st.line_chart(chart_df)
+else:
+    st.info("Pas assez de données pour afficher les courbes.")
