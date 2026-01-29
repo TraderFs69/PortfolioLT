@@ -15,9 +15,9 @@ st.set_page_config(page_title="📊 Portfolio Tracker Pro", layout="wide")
 conn = sqlite3.connect(DB_NAME, check_same_thread=False)
 c = conn.cursor()
 
+# ---- CREATE TABLE (nouvelle install) ----
 c.execute("""
 CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT,
     portfolio TEXT,
     ticker TEXT,
@@ -30,6 +30,17 @@ CREATE TABLE IF NOT EXISTS transactions (
 """)
 conn.commit()
 
+# ---- MIGRATION SAFE (ancienne table) ----
+def migrate_db():
+    cols = [row[1] for row in c.execute("PRAGMA table_info(transactions)").fetchall()]
+
+    if "currency" not in cols:
+        c.execute("ALTER TABLE transactions ADD COLUMN currency TEXT DEFAULT 'CAD'")
+
+    conn.commit()
+
+migrate_db()
+
 # ================= FX =================
 @st.cache_data(ttl=3600)
 def get_fx():
@@ -38,7 +49,7 @@ def get_fx():
 
 FX = get_fx()
 
-# ================= PRICES =================
+# ================= OHLC =================
 def get_ohlc_us(ticker, d):
     ds = d.strftime("%Y-%m-%d")
     url = f"https://api.polygon.io/v1/open-close/{ticker}/{ds}?adjusted=true&apiKey={POLYGON_KEY}"
@@ -71,26 +82,28 @@ def get_ohlc(ticker, market, d):
 
 # ================= TRANSACTIONS =================
 def add_tx(d, portfolio, ticker, market, action, qty, price, currency):
-    c.execute(
-        "INSERT INTO transactions VALUES (NULL,?,?,?,?,?,?,?)",
-        (d, portfolio, ticker, market, action, qty, price, currency)
-    )
+    c.execute("""
+        INSERT INTO transactions (
+            date, portfolio, ticker, market, action, quantity, price, currency
+        ) VALUES (?,?,?,?,?,?,?,?)
+    """, (d, portfolio, ticker, market, action, qty, price, currency))
     conn.commit()
 
-def delete_tx(tx_id):
-    c.execute("DELETE FROM transactions WHERE id=?", (tx_id,))
+def delete_tx(rowid):
+    c.execute("DELETE FROM transactions WHERE rowid=?", (rowid,))
     conn.commit()
 
 # ================= CASH =================
 def get_cash(portfolio):
     df = pd.read_sql(
         f"""
-        SELECT * FROM transactions 
-        WHERE portfolio='{portfolio}' 
+        SELECT * FROM transactions
+        WHERE portfolio='{portfolio}'
         AND action IN ('CASH_DEPOSIT','CASH_WITHDRAW','DIVIDEND')
         """,
         conn
     )
+
     if df.empty:
         return {"CAD": 0.0, "USD": 0.0}
 
@@ -98,23 +111,25 @@ def get_cash(portfolio):
         lambda x: x["quantity"] if x["action"] in ("CASH_DEPOSIT","DIVIDEND") else -x["quantity"],
         axis=1
     )
+
     return df.groupby("currency")["signed"].sum().to_dict()
 
 # ================= POSITIONS =================
 def load_positions(portfolio):
     df = pd.read_sql(
         f"""
-        SELECT * FROM transactions 
-        WHERE portfolio='{portfolio}' 
+        SELECT * FROM transactions
+        WHERE portfolio='{portfolio}'
         AND action IN ('BUY','SELL')
         """,
         conn
     )
+
     if df.empty:
         return pd.DataFrame()
 
     df["signed_qty"] = df.apply(
-        lambda x: x["quantity"] if x["action"]=="BUY" else -x["quantity"],
+        lambda x: x["quantity"] if x["action"] == "BUY" else -x["quantity"],
         axis=1
     )
 
@@ -138,7 +153,7 @@ def portfolio_value(portfolio):
             continue
         price = ohlc["Close"]
         val = price * r.quantity
-        total += val if r.currency=="CAD" else val * FX
+        total += val if r.currency == "CAD" else val * FX
 
     return total
 
@@ -169,7 +184,7 @@ if st.button("💾 Enregistrer cash/dividende"):
         1,
         cash_currency
     )
-    st.success("Enregistré")
+    st.success("Transaction enregistrée")
 
 cash = get_cash(portfolio)
 st.info(f"💵 Cash CAD : {cash.get('CAD',0):.2f} | 💲 Cash USD : {cash.get('USD',0):.2f}")
@@ -181,8 +196,8 @@ st.subheader("➕ Ticket de trade avancé")
 t1,t2,t3,t4 = st.columns([2,2,2,4])
 
 with t1:
-    ticker = st.text_input("Ticker", key="ticker")
-    market = st.selectbox("Marché", ["US","CA"], key="market")
+    ticker = st.text_input("Ticker")
+    market = st.selectbox("Marché", ["US","CA"])
     price_mode = st.selectbox("Prix de référence", ["Open","Close","VWAP"])
 
 with t2:
@@ -218,7 +233,7 @@ colA, colB = st.columns(2)
 with colA:
     if st.button("⚡ Auto-prix"):
         if ref_price:
-            st.session_state.price = round(ref_price,2)
+            st.session_state.price = round(ref_price, 2)
 
 with colB:
     if st.button("🧮 Taille auto (Risk %)"):
@@ -226,18 +241,18 @@ with colB:
             risk_dollars = portfolio_val * (risk_pct / 100)
             stop_distance = ref_price * (stop_pct / 100)
             qty = risk_dollars / stop_distance
-            qty = int(qty) if rounding=="Entier" else round(qty,2)
+            qty = int(qty) if rounding == "Entier" else round(qty, 2)
             st.session_state.qty = qty
-            st.session_state.price = round(ref_price,2)
+            st.session_state.price = round(ref_price, 2)
 
 price = st.number_input("Prix exécuté", min_value=0.0, key="price")
 qty = st.number_input("Quantité", min_value=0.0, key="qty")
 
-currency = "USD" if market=="US" else "CAD"
+currency = "USD" if market == "US" else "CAD"
 
 if st.button("💾 Enregistrer trade"):
     add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, ticker.upper(), market, "BUY", qty, price, currency)
-    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, "CASH", "N/A", "CASH_WITHDRAW", qty*price, 1, currency)
+    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, "CASH", "N/A", "CASH_WITHDRAW", qty * price, 1, currency)
     st.success("Trade enregistré")
 
 # -------- PERFORMANCE --------
@@ -250,10 +265,10 @@ st.metric("Valeur totale (CAD)", f"{portfolio_value(portfolio):,.2f}")
 st.divider()
 st.subheader("📒 Journal de transactions")
 
-journal = pd.read_sql("SELECT * FROM transactions ORDER BY date DESC", conn)
+journal = pd.read_sql("SELECT rowid,* FROM transactions ORDER BY date DESC", conn)
 st.dataframe(journal)
 
-tx_id = st.number_input("ID à supprimer", min_value=1, step=1)
+tx_id = st.number_input("rowid à supprimer", min_value=1, step=1)
 if st.button("🗑️ Supprimer transaction"):
     delete_tx(tx_id)
     st.warning("Transaction supprimée")
