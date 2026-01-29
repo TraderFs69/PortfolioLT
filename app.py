@@ -203,19 +203,18 @@ if not pos.empty:
     st.metric("Rendement total", f"{total_return:.2f} %")
     st.metric("CAGR", f"{cagr*100:.2f} %")
 
-  st.dataframe(
-    pos.style.format({
-        "quantity": "{:.2f}",
-        "avg_price": "{:.2f}",
-        "Prix actuel": "{:.2f}",
-        "Valeur (CAD)": "{:,.2f}",
-        "Coût (CAD)": "{:,.2f}",
-        "Gain %": "{:.2f}%"
-    })
-)
+    st.dataframe(
+        pos.style.format({
+            "quantity": "{:.2f}",
+            "avg_price": "{:.2f}",
+            "Prix actuel": "{:.2f}",
+            "Valeur (CAD)": "{:,.2f}",
+            "Coût (CAD)": "{:,.2f}",
+            "Gain %": "{:.2f}%"
+        })
+    )
 else:
     st.info("Aucune position dans ce portefeuille.")
-
 # ---------- JOURNAL ----------
 st.divider()
 st.subheader("📒 Journal des transactions")
