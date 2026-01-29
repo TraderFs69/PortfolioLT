@@ -1,15 +1,12 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import requests
 import yfinance as yf
 from datetime import date, timedelta
 import numpy as np
 
 # ================= CONFIG =================
 DB_NAME = "portfolio.db"
-POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
-
 st.set_page_config(page_title="📊 Portfolio Tracker", layout="wide")
 
 # ================= DB =================
@@ -30,9 +27,8 @@ CREATE TABLE IF NOT EXISTS transactions (
 """)
 conn.commit()
 
-# ---- MIGRATION SAFE ----
 def migrate_db():
-    cols = [row[1] for row in c.execute("PRAGMA table_info(transactions)").fetchall()]
+    cols = [r[1] for r in c.execute("PRAGMA table_info(transactions)")]
     if "currency" not in cols:
         c.execute("ALTER TABLE transactions ADD COLUMN currency TEXT DEFAULT 'CAD'")
     conn.commit()
@@ -45,40 +41,31 @@ def normalize_ticker(ticker, market):
         return ticker.upper() + ".TO"
     return ticker.upper()
 
-# ================= FX =================
 @st.cache_data(ttl=3600)
 def get_fx():
-    fx = yf.Ticker("USDCAD=X").history(period="1d")
-    return float(fx["Close"].iloc[-1])
+    return float(yf.Ticker("USDCAD=X").history(period="1d")["Close"].iloc[-1])
 
 FX = get_fx()
 
 # ================= OHLC =================
-def get_ohlc_us(ticker, d):
-    ds = d.strftime("%Y-%m-%d")
-    url = f"https://api.polygon.io/v1/open-close/{ticker}/{ds}?adjusted=true&apiKey={POLYGON_KEY}"
-    r = requests.get(url).json()
-    if r.get("status") != "OK":
-        return None
-    return {"Close": r["close"]}
-
-def get_ohlc_ca(ticker, d):
-    ticker = normalize_ticker(ticker, "CA")
+def get_ohlc(ticker, market, d):
+    ticker = normalize_ticker(ticker, market)
     df = yf.Ticker(ticker).history(start=d, end=d + timedelta(days=1))
     if df.empty:
         return None
-    return {"Close": float(df.iloc[0]["Close"])}
-
-def get_ohlc(ticker, market, d):
-    return get_ohlc_us(ticker, d) if market == "US" else get_ohlc_ca(ticker, d)
+    r = df.iloc[0]
+    return {
+        "Open": float(r["Open"]),
+        "High": float(r["High"]),
+        "Low": float(r["Low"]),
+        "Close": float(r["Close"])
+    }
 
 # ================= TRANSACTIONS =================
 def add_tx(d, portfolio, ticker, market, action, qty, price, currency):
     ticker = normalize_ticker(ticker, market)
     c.execute("""
-        INSERT INTO transactions (
-            date, portfolio, ticker, market, action, quantity, price, currency
-        ) VALUES (?,?,?,?,?,?,?,?)
+        INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?)
     """, (d, portfolio, ticker, market, action, qty, price, currency))
     conn.commit()
 
@@ -89,147 +76,144 @@ def delete_tx(rowid):
 # ================= CASH =================
 def get_cash(portfolio):
     df = pd.read_sql(
-        """
-        SELECT * FROM transactions
-        WHERE portfolio = ?
-        AND action IN ('CASH_DEPOSIT','CASH_WITHDRAW','DIVIDEND')
-        """,
-        conn,
-        params=(portfolio,)
+        "SELECT * FROM transactions WHERE portfolio=? AND action IN ('CASH_DEPOSIT','CASH_WITHDRAW','DIVIDEND')",
+        conn, params=(portfolio,)
     )
-
-    if df.empty:
-        return {"CAD": 0.0, "USD": 0.0}
-
-    df["signed"] = df.apply(
-        lambda x: x["quantity"] if x["action"] in ("CASH_DEPOSIT","DIVIDEND") else -x["quantity"],
-        axis=1
-    )
-    return df.groupby("currency")["signed"].sum().to_dict()
+    cash = {"CAD": 0.0, "USD": 0.0}
+    for _, r in df.iterrows():
+        sign = 1 if r["action"] in ("CASH_DEPOSIT","DIVIDEND") else -1
+        cash[r["currency"]] += sign * r["quantity"]
+    return cash
 
 # ================= POSITIONS =================
 def load_positions(portfolio):
     df = pd.read_sql(
-        """
-        SELECT * FROM transactions
-        WHERE portfolio = ?
-        AND action IN ('BUY','SELL')
-        """,
-        conn,
-        params=(portfolio,)
+        "SELECT * FROM transactions WHERE portfolio=? AND action IN ('BUY','SELL')",
+        conn, params=(portfolio,)
     )
-
     if df.empty:
         return pd.DataFrame()
 
-    df["signed_qty"] = df.apply(
-        lambda x: x["quantity"] if x["action"] == "BUY" else -x["quantity"],
-        axis=1
-    )
-
+    df["signed"] = df.apply(lambda r: r["quantity"] if r["action"]=="BUY" else -r["quantity"], axis=1)
     pos = df.groupby(["ticker","market","currency"]).agg(
-        quantity=("signed_qty","sum"),
+        quantity=("signed","sum"),
         avg_price=("price","mean")
     ).reset_index()
-
-    return pos[pos["quantity"] > 0]
+    return pos[pos["quantity"]>0]
 
 # ================= PORTFOLIO VALUE =================
 def portfolio_value_at_date(portfolio, d):
     df = pd.read_sql(
-        "SELECT * FROM transactions WHERE portfolio = ? AND date <= ?",
-        conn,
-        params=(portfolio, d.strftime("%Y-%m-%d"))
+        "SELECT * FROM transactions WHERE portfolio=? AND date<=?",
+        conn, params=(portfolio, d.strftime("%Y-%m-%d"))
     )
-
-    cash = {"CAD": 0.0, "USD": 0.0}
-    positions = {}
-
+    cash = {"CAD":0.0,"USD":0.0}
+    pos = {}
     for _, r in df.iterrows():
-        if r["action"] == "CASH_DEPOSIT":
-            cash[r["currency"]] += r["quantity"]
-        elif r["action"] == "CASH_WITHDRAW":
-            cash[r["currency"]] -= r["quantity"]
-        elif r["action"] == "BUY":
-            positions.setdefault((r["ticker"], r["market"], r["currency"]), 0)
-            positions[(r["ticker"], r["market"], r["currency"])] += r["quantity"]
-        elif r["action"] == "SELL":
-            positions.setdefault((r["ticker"], r["market"], r["currency"]), 0)
-            positions[(r["ticker"], r["market"], r["currency"])] -= r["quantity"]
+        if r["action"]=="CASH_DEPOSIT": cash[r["currency"]] += r["quantity"]
+        if r["action"]=="CASH_WITHDRAW": cash[r["currency"]] -= r["quantity"]
+        if r["action"]=="BUY": pos[r["ticker"]] = pos.get(r["ticker"],0)+r["quantity"]
+        if r["action"]=="SELL": pos[r["ticker"]] = pos.get(r["ticker"],0)-r["quantity"]
 
-    total = cash["CAD"] + cash["USD"] * FX
-
-    for (ticker, market, currency), qty in positions.items():
-        if qty <= 0:
-            continue
-        ohlc = get_ohlc(ticker, market, d)
-        if not ohlc:
-            continue
-        value = ohlc["Close"] * qty
-        total += value if currency == "CAD" else value * FX
-
+    total = cash["CAD"] + cash["USD"]*FX
+    for t, q in pos.items():
+        if q<=0: continue
+        ohlc = get_ohlc(t,"CA" if t.endswith(".TO") else "US", d)
+        if ohlc:
+            total += ohlc["Close"]*q*(1 if t.endswith(".TO") else FX)
     return total
 
 def portfolio_timeseries(portfolio):
     df = pd.read_sql(
-        "SELECT MIN(date) as start, MAX(date) as end FROM transactions WHERE portfolio = ?",
-        conn,
-        params=(portfolio,)
+        "SELECT MIN(date) start, MAX(date) end FROM transactions WHERE portfolio=?",
+        conn, params=(portfolio,)
     )
-
     if df.iloc[0]["start"] is None:
         return pd.DataFrame()
-
-    dates = pd.date_range(df.iloc[0]["start"], df.iloc[0]["end"], freq="D")
+    dates = pd.date_range(df.iloc[0]["start"], date.today(), freq="D")
     return pd.DataFrame({
         "Date": dates,
-        "Valeur": [portfolio_value_at_date(portfolio, d) for d in dates]
+        "Valeur": [portfolio_value_at_date(portfolio,d) for d in dates]
     })
-
-# ================= BENCHMARK =================
-@st.cache_data(ttl=3600)
-def benchmark_series(symbol, start, end):
-    df = yf.Ticker(symbol).history(start=start, end=end)
-    if df.empty:
-        return pd.DataFrame()
-    df = df.reset_index()[["Date", "Close"]]
-    df["Valeur"] = df["Close"] / df["Close"].iloc[0] * 100
-    return df[["Date", "Valeur"]]
 
 # ================= UI =================
 st.title("📊 Portfolio Tracker")
 
+portfolio = st.selectbox("📁 Portefeuille", ["ETF","CROISSANCE","RISQUE"])
+
+# -------- CASH --------
+st.subheader("💰 Cash")
+c1,c2,c3 = st.columns(3)
+with c1: action = st.selectbox("Action",["CASH_DEPOSIT","CASH_WITHDRAW","DIVIDEND"])
+with c2: amount = st.number_input("Montant",min_value=0.0)
+with c3: currency = st.selectbox("Devise",["CAD","USD"])
+
+if st.button("Enregistrer cash"):
+    add_tx(date.today().strftime("%Y-%m-%d"),portfolio,"CASH","N/A",action,amount,1,currency)
+
+cash = get_cash(portfolio)
+st.info(f"CAD: {cash['CAD']:.2f} | USD: {cash['USD']:.2f}")
+
+# -------- TRADE --------
+st.subheader("➕ Achat / Vente")
+t1,t2,t3,t4 = st.columns(4)
+with t1: ticker = st.text_input("Ticker")
+with t2: market = st.selectbox("Marché",["US","CA"])
+with t3: tx_date = st.date_input("Date",date.today())
+with t4: price_mode = st.selectbox("Prix",["Open","Close"])
+
+ohlc = get_ohlc(ticker,market,tx_date) if ticker else None
+if ohlc:
+    st.caption(f"O:{ohlc['Open']} H:{ohlc['High']} L:{ohlc['Low']} C:{ohlc['Close']}")
+
+ref = ohlc[price_mode] if ohlc else None
+amount = st.number_input("Montant à investir",min_value=0.0)
+if st.button("Auto"):
+    if ref:
+        st.session_state.price = ref
+        st.session_state.qty = amount/ref if ref>0 else 0
+
+price = st.number_input("Prix",key="price")
+qty = st.number_input("Quantité",key="qty")
+
+if st.button("Acheter"):
+    add_tx(tx_date.strftime("%Y-%m-%d"),portfolio,ticker,market,"BUY",qty,price,"USD" if market=="US" else "CAD")
+    add_tx(tx_date.strftime("%Y-%m-%d"),portfolio,"CASH","N/A","CASH_WITHDRAW",qty*price,1,"USD" if market=="US" else "CAD")
+
+# -------- SUMMARY --------
+st.divider()
+st.subheader("📊 Rendement des portefeuilles")
+
+rows=[]
+for p in ["ETF","CROISSANCE","RISQUE"]:
+    ts = portfolio_timeseries(p)
+    if ts.empty: continue
+    invested = ts["Valeur"].iloc[0]
+    current = ts["Valeur"].iloc[-1]
+    years = (ts["Date"].iloc[-1]-ts["Date"].iloc[0]).days/365.25
+    cagr = (current/invested)**(1/years)-1 if years>0 else 0
+    rows.append({"Portefeuille":p,"Valeur actuelle":current,"CAGR %":cagr*100})
+
+st.dataframe(pd.DataFrame(rows))
+
+# -------- BENCHMARK --------
 st.subheader("📈 Évolution comparée + Benchmark")
 
-series = []
-start_dates = []
-
+series=[]
+start=None
 for p in ["ETF","CROISSANCE","RISQUE"]:
     ts = portfolio_timeseries(p)
     if not ts.empty:
-        ts["Valeur"] = ts["Valeur"] / ts["Valeur"].iloc[0] * 100
-        ts["Label"] = p
+        ts["Valeur"]=ts["Valeur"]/ts["Valeur"].iloc[0]*100
+        ts["Label"]=p
         series.append(ts)
-        start_dates.append(ts["Date"].min())
+        start = ts["Date"].iloc[0] if start is None else min(start,ts["Date"].iloc[0])
 
 if series:
-    start = min(start_dates)
-    end = date.today()
-
-    sp500 = benchmark_series("^GSPC", start, end)
-    tsx = benchmark_series("^GSPTSE", start, end)
-
-    if not sp500.empty:
-        sp500["Label"] = "S&P 500"
-        series.append(sp500)
-
-    if not tsx.empty:
-        tsx["Label"] = "TSX Composite"
-        series.append(tsx)
-
-    df_all = pd.concat(series)
-    chart_df = df_all.pivot(index="Date", columns="Label", values="Valeur")
-
-    st.line_chart(chart_df)
-else:
-    st.info("Pas assez de données pour afficher les courbes.")
+    sp = yf.Ticker("^GSPC").history(start=start)["Close"]
+    tsx = yf.Ticker("^GSPTSE").history(start=start)["Close"]
+    df = pd.concat(series)
+    chart = df.pivot(index="Date",columns="Label",values="Valeur")
+    chart["S&P 500"]=sp/sp.iloc[0]*100
+    chart["TSX"]=tsx/tsx.iloc[0]*100
+    st.line_chart(chart)
