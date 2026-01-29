@@ -48,14 +48,22 @@ def get_ohlc(ticker, market, d):
         r = requests.get(url).json()
         if r.get("status") != "OK":
             return None
-        return {"Open": r["open"], "High": r["high"], "Low": r["low"], "Close": r["close"]}
+        return {"Close": r["close"], "Open": r["open"]}
     else:
         ticker = normalize_ticker(ticker, "CA")
         df = yf.Ticker(ticker).history(start=d, end=d + timedelta(days=1))
         if df.empty:
             return None
         r = df.iloc[0]
-        return {"Open": r["Open"], "High": r["High"], "Low": r["Low"], "Close": r["Close"]}
+        return {"Close": r["Close"], "Open": r["Open"]}
+
+def get_last_close(ticker, market):
+    for i in range(7):
+        d = date.today() - timedelta(days=i)
+        ohlc = get_ohlc(ticker, market, d)
+        if ohlc and ohlc.get("Close") is not None:
+            return ohlc["Close"]
+    return None
 
 # ================= TRANSACTIONS =================
 def add_tx(d, portfolio, ticker, market, action, qty, price, currency):
@@ -79,6 +87,7 @@ def load_positions(portfolio):
         return pd.DataFrame()
 
     df["signed"] = df.apply(lambda x: x["quantity"] if x["action"]=="BUY" else -x["quantity"], axis=1)
+
     pos = df.groupby(["ticker","market","currency"]).agg(
         quantity=("signed","sum"),
         avg_price=("price","mean")
@@ -86,19 +95,16 @@ def load_positions(portfolio):
 
     pos = pos[pos["quantity"] > 0]
 
-    prices = []
-    values = []
+    prices, values = [], []
 
     for _, r in pos.iterrows():
-        ohlc = get_ohlc(r.ticker, r.market, date.today())
-        if not ohlc:
-            prices.append(0)
-            values.append(0)
+        price = get_last_close(r.ticker, r.market)
+        prices.append(price)
+        if price:
+            v = price * r.quantity
+            values.append(v if r.currency=="CAD" else v * FX)
         else:
-            p = ohlc["Close"]
-            prices.append(p)
-            v = p * r.quantity
-            values.append(v if r.currency=="CAD" else v*FX)
+            values.append(None)
 
     pos["Prix actuel"] = prices
     pos["Valeur (CAD)"] = values
@@ -106,22 +112,15 @@ def load_positions(portfolio):
 
     return pos
 
-# ================= PORTFOLIO VALUE =================
-def portfolio_value(portfolio):
-    pos = load_positions(portfolio)
-    if pos.empty:
-        return 0
-    return pos["Valeur (CAD)"].sum()
-
 # ================= UI =================
-st.title("📊 Portfolio Tracker Complet")
+st.title("📊 Portfolio Tracker")
 
 portfolio = st.selectbox("📁 Portefeuille", ["ETF","CROISSANCE","RISQUE"])
 
-# ---------- ACHAT / VENTE ----------
+# ---------- ACHAT ----------
 st.subheader("➕ Achat / Vente")
 
-c1,c2,c3,c4 = st.columns(4)
+c1,c2,c3 = st.columns(3)
 
 with c1:
     ticker = st.text_input("Ticker")
@@ -134,24 +133,15 @@ with c2:
 
 with c3:
     rounding = st.selectbox("Arrondi", ["Entier","2 décimales"])
-    action = st.selectbox("Action", ["BUY","SELL"])
 
-with c4:
-    ohlc = get_ohlc(ticker, market, tx_date) if ticker else None
-    if ohlc:
-        st.markdown(
-            f"""
-            **OHLC**
-            Open: {ohlc['Open']:.2f}
-            High: {ohlc['High']:.2f}
-            Low: {ohlc['Low']:.2f}
-            Close: {ohlc['Close']:.2f}
-            """
-        )
+ohlc = get_ohlc(ticker, market, tx_date) if ticker else None
+
+if ohlc:
+    st.caption(f"Open {ohlc['Open']:.2f} | Close {ohlc['Close']:.2f}")
 
 ref_price = ohlc[price_mode] if ohlc else None
 
-if st.button("⚡ Auto-calcul quantité") and ref_price and montant>0:
+if st.button("⚡ Calculer quantité") and ref_price and montant>0:
     qty = montant / ref_price
     qty = int(qty) if rounding=="Entier" else round(qty,2)
     st.session_state.qty = qty
@@ -164,57 +154,38 @@ currency = "USD" if market=="US" else "CAD"
 
 if st.button("💾 Enregistrer"):
     add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, normalize_ticker(ticker, market),
-           market, action, qty, price, currency)
+           market, "BUY", qty, price, currency)
     st.success("Transaction enregistrée")
 
 # ---------- COMPOSITION ----------
 st.divider()
-st.subheader(f"📦 Composition du portefeuille {portfolio}")
-pos = load_positions(portfolio)
-st.dataframe(pos)
+st.subheader(f"📦 Composition {portfolio}")
+st.dataframe(load_positions(portfolio))
 
 # ---------- JOURNAL ----------
 st.divider()
 st.subheader("📒 Journal des transactions")
 
 journal = pd.read_sql(
-    "SELECT rowid as id, * FROM transactions ORDER BY date DESC",
+    """
+    SELECT
+        rowid AS tx_id,
+        date,
+        portfolio,
+        ticker,
+        market,
+        action,
+        quantity,
+        price,
+        currency
+    FROM transactions
+    ORDER BY date DESC
+    """,
     conn
 )
 st.dataframe(journal)
 
-tx_id = st.number_input("ID à supprimer", min_value=1, step=1)
+tx_id = st.number_input("tx_id à supprimer", min_value=1, step=1)
 if st.button("🗑️ Supprimer"):
     delete_tx(tx_id)
     st.warning("Transaction supprimée")
-
-# ---------- RENDEMENT ----------
-st.divider()
-st.subheader("📊 Valeur des portefeuilles")
-
-rows=[]
-for p in ["ETF","CROISSANCE","RISQUE"]:
-    rows.append({"Portefeuille":p,"Valeur (CAD)":portfolio_value(p)})
-
-st.dataframe(pd.DataFrame(rows))
-
-# ---------- BENCHMARK ----------
-st.divider()
-st.subheader("📈 Évolution comparée & benchmark")
-
-series=[]
-start=date.today()-timedelta(days=365)
-
-for p in ["ETF","CROISSANCE","RISQUE"]:
-    ts=[]
-    for d in pd.date_range(start,date.today()):
-        ts.append(portfolio_value(p))
-    series.append(pd.Series(ts,name=p))
-
-sp500=yf.Ticker("^GSPC").history(start=start)["Close"]
-tsx=yf.Ticker("^GSPTSE").history(start=start)["Close"]
-
-df=pd.concat(series+[sp500/sp500.iloc[0]*100, tsx/tsx.iloc[0]*100],axis=1)
-df.columns=["ETF","CROISSANCE","RISQUE","S&P500","TSX"]
-
-st.line_chart(df)
