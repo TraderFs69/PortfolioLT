@@ -38,6 +38,12 @@ def migrate_db():
 
 migrate_db()
 
+# ================= HELPERS =================
+def normalize_ticker(ticker, market):
+    if market == "CA" and not ticker.upper().endswith(".TO"):
+        return ticker.upper() + ".TO"
+    return ticker.upper()
+
 # ================= FX =================
 @st.cache_data(ttl=3600)
 def get_fx():
@@ -58,10 +64,11 @@ def get_ohlc_us(ticker, d):
         "High": r["high"],
         "Low": r["low"],
         "Close": r["close"],
-        "VWAP": r.get("vwap")  # peut être None
+        "VWAP": r.get("vwap")
     }
 
 def get_ohlc_ca(ticker, d):
+    ticker = normalize_ticker(ticker, "CA")
     df = yf.Ticker(ticker).history(start=d, end=d + timedelta(days=1))
     if df.empty:
         return None
@@ -71,7 +78,7 @@ def get_ohlc_ca(ticker, d):
         "High": float(row["High"]),
         "Low": float(row["Low"]),
         "Close": float(row["Close"]),
-        "VWAP": None  # Yahoo ne fournit pas le vrai VWAP journalier
+        "VWAP": None
     }
 
 def get_ohlc(ticker, market, d):
@@ -79,6 +86,7 @@ def get_ohlc(ticker, market, d):
 
 # ================= TRANSACTIONS =================
 def add_tx(d, portfolio, ticker, market, action, qty, price, currency):
+    ticker = normalize_ticker(ticker, market)
     c.execute("""
         INSERT INTO transactions (
             date, portfolio, ticker, market, action, quantity, price, currency
@@ -194,7 +202,7 @@ st.subheader("➕ Achat / Vente")
 t1,t2,t3,t4 = st.columns([2,2,2,4])
 
 with t1:
-    ticker = st.text_input("Ticker")
+    ticker = st.text_input("Ticker (ex: XUU, CNQ)")
     market = st.selectbox("Marché", ["US","CA"])
     price_mode = st.selectbox("Prix de référence", ["Open","Close","VWAP"])
 
@@ -206,7 +214,7 @@ with t3:
     rounding = st.selectbox("Arrondi quantité", ["Entier","2 décimales"])
 
 with t4:
-    ohlc = get_ohlc(ticker.upper(), market, tx_date) if ticker else None
+    ohlc = get_ohlc(ticker, market, tx_date) if ticker else None
     st.markdown("**📊 OHLC**")
     if ohlc:
         st.markdown(
@@ -217,12 +225,10 @@ with t4:
             Close : **{ohlc['Close']:.2f}**
             """
         )
-        if ohlc["VWAP"] is not None:
-            st.markdown(f"VWAP : **{ohlc['VWAP']:.2f}**")
     else:
         st.caption("Aucune donnée disponible")
 
-ref_price = ohlc[price_mode] if ohlc and ohlc.get(price_mode) is not None else None
+ref_price = ohlc.get(price_mode) if ohlc else None
 
 if st.button("⚡ Auto-prix") and ref_price:
     st.session_state.price = round(ref_price,2)
@@ -239,14 +245,13 @@ qty = st.number_input("Quantité", min_value=0.0, key="qty")
 currency = "USD" if market=="US" else "CAD"
 
 if st.button("💾 Enregistrer trade"):
-    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, ticker.upper(), market, "BUY", qty, price, currency)
+    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, ticker, market, "BUY", qty, price, currency)
     add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, "CASH", "N/A", "CASH_WITHDRAW", qty*price, 1, currency)
     st.success("Trade enregistré")
 
 # -------- PERFORMANCE --------
 st.divider()
 st.subheader("📊 Performance globale")
-
 st.metric("Valeur totale (CAD)", f"{portfolio_value(portfolio):,.2f}")
 
 # -------- JOURNAL --------
