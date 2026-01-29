@@ -9,13 +9,12 @@ from datetime import date, timedelta
 DB_NAME = "portfolio.db"
 POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 
-st.set_page_config(page_title="📊 Portfolio Tracker Pro", layout="wide")
+st.set_page_config(page_title="📊 Portfolio Tracker", layout="wide")
 
 # ================= DB =================
 conn = sqlite3.connect(DB_NAME, check_same_thread=False)
 c = conn.cursor()
 
-# ---- CREATE TABLE (nouvelle install) ----
 c.execute("""
 CREATE TABLE IF NOT EXISTS transactions (
     date TEXT,
@@ -59,7 +58,7 @@ def get_ohlc_us(ticker, d):
         "High": r["high"],
         "Low": r["low"],
         "Close": r["close"],
-        "VWAP": r.get("vwap")
+        "VWAP": r.get("vwap")  # peut être None
     }
 
 def get_ohlc_ca(ticker, d):
@@ -72,7 +71,7 @@ def get_ohlc_ca(ticker, d):
         "High": float(row["High"]),
         "Low": float(row["Low"]),
         "Close": float(row["Close"]),
-        "VWAP": float((row["High"] + row["Low"] + row["Close"]) / 3)
+        "VWAP": None  # Yahoo ne fournit pas le vrai VWAP journalier
     }
 
 def get_ohlc(ticker, market, d):
@@ -157,12 +156,12 @@ def portfolio_value(portfolio):
     return total
 
 # ================= UI =================
-st.title("📊 Portfolio Tracker Pro")
+st.title("📊 Portfolio Tracker")
 
 portfolio = st.selectbox("📁 Portefeuille", ["ETF","CROISSANCE","RISQUE"])
 
-# -------- CASH / DIVIDENDES --------
-st.subheader("💰 Cash & Dividendes")
+# -------- CASH --------
+st.subheader("💰 Cash")
 
 c1,c2,c3 = st.columns(3)
 with c1:
@@ -172,7 +171,7 @@ with c2:
 with c3:
     cash_currency = st.selectbox("Devise", ["CAD","USD"])
 
-if st.button("💾 Enregistrer cash/dividende"):
+if st.button("💾 Enregistrer cash"):
     add_tx(
         date.today().strftime("%Y-%m-%d"),
         portfolio,
@@ -183,14 +182,14 @@ if st.button("💾 Enregistrer cash/dividende"):
         1,
         cash_currency
     )
-    st.success("Transaction enregistrée")
+    st.success("Cash enregistré")
 
 cash = get_cash(portfolio)
 st.info(f"💵 Cash CAD : {cash.get('CAD',0):.2f} | 💲 Cash USD : {cash.get('USD',0):.2f}")
 
-# -------- TICKET DE TRADE --------
+# -------- TRADE --------
 st.divider()
-st.subheader("➕ Ticket de trade avancé")
+st.subheader("➕ Achat / Vente")
 
 t1,t2,t3,t4 = st.columns([2,2,2,4])
 
@@ -200,55 +199,48 @@ with t1:
     price_mode = st.selectbox("Prix de référence", ["Open","Close","VWAP"])
 
 with t2:
-    risk_pct = st.number_input("⚠️ Risk % portefeuille", min_value=0.0, max_value=10.0, value=1.0)
+    target_amount = st.number_input("💰 Montant désiré", min_value=0.0)
 
 with t3:
-    stop_pct = st.number_input("📉 Stop (%)", min_value=0.0, value=5.0)
+    tx_date = st.date_input("Date", value=date.today())
     rounding = st.selectbox("Arrondi quantité", ["Entier","2 décimales"])
 
 with t4:
-    tx_date = st.date_input("Date", value=date.today())
+    ohlc = get_ohlc(ticker.upper(), market, tx_date) if ticker else None
+    st.markdown("**📊 OHLC**")
+    if ohlc:
+        st.markdown(
+            f"""
+            Open : **{ohlc['Open']:.2f}**  
+            High : **{ohlc['High']:.2f}**  
+            Low : **{ohlc['Low']:.2f}**  
+            Close : **{ohlc['Close']:.2f}**
+            """
+        )
+        if ohlc["VWAP"] is not None:
+            st.markdown(f"VWAP : **{ohlc['VWAP']:.2f}**")
+    else:
+        st.caption("Aucune donnée disponible")
 
-ohlc = get_ohlc(ticker.upper(), market, tx_date) if ticker else None
+ref_price = ohlc[price_mode] if ohlc and ohlc.get(price_mode) is not None else None
 
-if ohlc:
-    st.markdown(
-        f"""
-        **📊 OHLC**
-        - Open : **{ohlc['Open']:.2f}**
-        - High : **{ohlc['High']:.2f}**
-        - Low : **{ohlc['Low']:.2f}**
-        - Close : **{ohlc['Close']:.2f}**
-        - VWAP : **{ohlc['VWAP']:.2f}**
-        """
-    )
+if st.button("⚡ Auto-prix") and ref_price:
+    st.session_state.price = round(ref_price,2)
 
-ref_price = ohlc[price_mode] if ohlc else None
-portfolio_val = portfolio_value(portfolio)
-
-colA, colB = st.columns(2)
-
-with colA:
-    if st.button("⚡ Auto-prix") and ref_price:
-        st.session_state.price = round(ref_price, 2)
-
-with colB:
-    if st.button("🧮 Taille auto (Risk %)") and ref_price and portfolio_val > 0:
-        risk_dollars = portfolio_val * (risk_pct / 100)
-        stop_distance = ref_price * (stop_pct / 100)
-        qty = risk_dollars / stop_distance
-        qty = int(qty) if rounding == "Entier" else round(qty, 2)
-        st.session_state.qty = qty
-        st.session_state.price = round(ref_price, 2)
+if st.button("🧮 Calculer quantité") and ref_price and target_amount > 0:
+    qty = target_amount / ref_price
+    qty = int(qty) if rounding=="Entier" else round(qty,2)
+    st.session_state.qty = qty
+    st.session_state.price = round(ref_price,2)
 
 price = st.number_input("Prix exécuté", min_value=0.0, key="price")
 qty = st.number_input("Quantité", min_value=0.0, key="qty")
 
-currency = "USD" if market == "US" else "CAD"
+currency = "USD" if market=="US" else "CAD"
 
 if st.button("💾 Enregistrer trade"):
     add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, ticker.upper(), market, "BUY", qty, price, currency)
-    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, "CASH", "N/A", "CASH_WITHDRAW", qty * price, 1, currency)
+    add_tx(tx_date.strftime("%Y-%m-%d"), portfolio, "CASH", "N/A", "CASH_WITHDRAW", qty*price, 1, currency)
     st.success("Trade enregistré")
 
 # -------- PERFORMANCE --------
