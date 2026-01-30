@@ -81,7 +81,7 @@ def get_last_closes_ca(tickers):
 
     prices = {}
 
-    # 🔥 CAS 1 SEUL TICKER (BUG SHOP.TO)
+    # --- Cas 1 seul ticker (ex: SHOP.TO) ---
     if isinstance(tickers, list) and len(tickers) == 1:
         try:
             prices[tickers[0]] = float(data["Close"].dropna().iloc[-1])
@@ -89,7 +89,7 @@ def get_last_closes_ca(tickers):
             prices[tickers[0]] = None
         return prices
 
-    # 🔥 PLUSIEURS TICKERS
+    # --- Plusieurs tickers ---
     for t in tickers:
         try:
             prices[t] = float(data[t]["Close"].dropna().iloc[-1])
@@ -143,126 +143,29 @@ def load_positions(portfolio):
 
     return pos, df
 
-# ================= METRICS =================
+# ================= METRICS (SÉCURISÉ) =================
 def portfolio_metrics(pos, df):
     total_value = pos["Valeur (CAD)"].sum()
     total_cost = pos["Coût (CAD)"].sum()
-    total_return = (total_value / total_cost - 1) * 100 if total_cost > 0 else 0
 
+    # Rendement total
+    if total_cost > 0:
+        total_return = (total_value / total_cost - 1) * 100
+    else:
+        total_return = 0.0
+
+    # CAGR sécurisé
     start_date = pd.to_datetime(df["date"]).min()
     years = (pd.Timestamp.today() - start_date).days / 365.25
-    cagr = (total_value / total_cost) ** (1 / years) - 1 if years > 0 else 0
+
+    if total_cost > 0 and years > 0:
+        cagr = (total_value / total_cost) ** (1 / years) - 1
+    else:
+        cagr = 0.0
 
     return total_value, total_return, cagr
 
 # ================= UI =================
 st.title("📊 Portfolio Tracker")
 
-portfolio = st.selectbox("📁 Portefeuille", ["ETF", "CROISSANCE", "RISQUE"])
-
-st.subheader("➕ Achat / Vente")
-
-c1, c2, c3 = st.columns(3)
-
-with c1:
-    ticker = st.text_input("Ticker")
-    market = st.selectbox("Marché", ["US", "CA"])
-    action = st.selectbox("Action", ["BUY", "SELL"])
-    price_mode = st.selectbox("Prix utilisé", ["Open", "Close"])
-
-with c2:
-    tx_date = st.date_input("Date", value=date.today())
-    montant = st.number_input("Montant $", min_value=0.0)
-
-with c3:
-    rounding = st.selectbox("Arrondi", ["Entier", "2 décimales"])
-
-ohlc = get_ohlc(ticker, market, tx_date) if ticker else None
-if ohlc:
-    st.caption(f"Open : {ohlc['Open']:.2f} | Close : {ohlc['Close']:.2f}")
-
-ref_price = ohlc[price_mode] if ohlc else None
-
-if st.button("⚡ Calculer quantité") and ref_price and montant > 0:
-    qty = montant / ref_price
-    qty = int(qty) if rounding == "Entier" else round(qty, 2)
-    st.session_state.qty = qty
-    st.session_state.price = round(ref_price, 2)
-
-price = st.number_input("Prix exécuté", key="price")
-qty = st.number_input("Quantité", key="qty")
-currency = "USD" if market == "US" else "CAD"
-
-# ----- VALIDATION SELL -----
-if action == "SELL":
-    pos_check, _ = load_positions(portfolio)
-    held = pos_check.loc[pos_check["ticker"] == normalize_ticker(ticker, market), "quantity"]
-    max_qty = float(held.iloc[0]) if not held.empty else 0.0
-    st.info(f"Quantité détenue : {max_qty:.2f}")
-    if qty > max_qty:
-        st.error("Quantité de vente supérieure à la position détenue.")
-        st.stop()
-
-# ----- INSERT ROBUSTE -----
-if st.button("💾 Enregistrer"):
-    c.execute(
-        """
-        INSERT INTO transactions
-        (date, portfolio, ticker, market, action, quantity, price, currency)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            tx_date.strftime("%Y-%m-%d"),
-            portfolio,
-            normalize_ticker(ticker, market),
-            market,
-            action,
-            qty,
-            price,
-            currency
-        )
-    )
-    conn.commit()
-    st.success("Transaction enregistrée")
-
-# ---------- COMPOSITION ----------
-st.divider()
-st.subheader(f"📦 Composition {portfolio}")
-
-pos, df_port = load_positions(portfolio)
-
-if not pos.empty:
-    total_value, total_return, cagr = portfolio_metrics(pos, df_port)
-
-    st.metric("Valeur totale (CAD)", f"{total_value:,.2f}")
-    st.metric("Rendement total", f"{total_return:.2f} %")
-    st.metric("CAGR", f"{cagr * 100:.2f} %")
-
-    st.dataframe(
-        pos.style.format({
-            "quantity": "{:.2f}",
-            "avg_price": "{:.2f}",
-            "Prix actuel": "{:.2f}",
-            "Valeur (CAD)": "{:,.2f}",
-            "Coût (CAD)": "{:,.2f}",
-            "Gain %": "{:.2f}%"
-        })
-    )
-else:
-    st.info("Aucune position dans ce portefeuille.")
-
-# ---------- JOURNAL ----------
-st.divider()
-st.subheader("📒 Journal des transactions")
-
-journal = pd.read_sql(
-    """
-    SELECT rowid AS tx_id, date, portfolio, ticker, market,
-           action, quantity, price, currency
-    FROM transactions
-    ORDER BY date DESC
-    """,
-    conn
-)
-
-st.dataframe(journal)
+portfolio = st.selectbo
