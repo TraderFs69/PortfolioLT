@@ -71,16 +71,31 @@ def get_last_close_us(ticker):
 def get_last_closes_ca(tickers):
     if not tickers:
         return {}
-    data = yf.download(tickers, period="5d", group_by="ticker", progress=False)
+
+    data = yf.download(
+        tickers=tickers,
+        period="5d",
+        auto_adjust=False,
+        progress=False
+    )
+
     prices = {}
+
+    # 🔥 CAS 1 SEUL TICKER (BUG SHOP.TO)
+    if isinstance(tickers, list) and len(tickers) == 1:
+        try:
+            prices[tickers[0]] = float(data["Close"].dropna().iloc[-1])
+        except Exception:
+            prices[tickers[0]] = None
+        return prices
+
+    # 🔥 PLUSIEURS TICKERS
     for t in tickers:
         try:
-            if len(tickers) == 1:
-                prices[t] = float(data["Close"].dropna().iloc[-1])
-            else:
-                prices[t] = float(data[t]["Close"].dropna().iloc[-1])
+            prices[t] = float(data[t]["Close"].dropna().iloc[-1])
         except Exception:
             prices[t] = None
+
     return prices
 
 # ================= POSITIONS =================
@@ -92,29 +107,29 @@ def load_positions(portfolio):
     if df.empty:
         return pd.DataFrame(), df
 
-    df["signed"] = np.where(df["action"]=="BUY", df["quantity"], -df["quantity"])
+    df["signed"] = np.where(df["action"] == "BUY", df["quantity"], -df["quantity"])
 
-    pos = df.groupby(["ticker","market","currency"]).agg(
-        quantity=("signed","sum"),
-        avg_price=("price","mean")
+    pos = df.groupby(["ticker", "market", "currency"]).agg(
+        quantity=("signed", "sum"),
+        avg_price=("price", "mean")
     ).reset_index()
 
     pos = pos[pos["quantity"] > 0]
 
-    ca_tickers = pos[pos["market"]=="CA"]["ticker"].tolist()
+    ca_tickers = pos[pos["market"] == "CA"]["ticker"].tolist()
     ca_prices = get_last_closes_ca(ca_tickers)
 
     prices, values, costs = [], [], []
 
     for _, r in pos.iterrows():
-        price = ca_prices.get(r.ticker) if r.market=="CA" else get_last_close_us(r.ticker)
+        price = ca_prices.get(r.ticker) if r.market == "CA" else get_last_close_us(r.ticker)
         prices.append(price)
 
         if price is not None:
             val = price * r.quantity
-            val_cad = val if r.currency=="CAD" else val * FX
+            val_cad = val if r.currency == "CAD" else val * FX
             cost = r.avg_price * r.quantity
-            cost_cad = cost if r.currency=="CAD" else cost * FX
+            cost_cad = cost if r.currency == "CAD" else cost * FX
         else:
             val_cad, cost_cad = None, None
 
@@ -136,32 +151,31 @@ def portfolio_metrics(pos, df):
 
     start_date = pd.to_datetime(df["date"]).min()
     years = (pd.Timestamp.today() - start_date).days / 365.25
-    cagr = (total_value / total_cost) ** (1/years) - 1 if years > 0 else 0
+    cagr = (total_value / total_cost) ** (1 / years) - 1 if years > 0 else 0
 
     return total_value, total_return, cagr
 
 # ================= UI =================
 st.title("📊 Portfolio Tracker")
 
-portfolio = st.selectbox("📁 Portefeuille", ["ETF","CROISSANCE","RISQUE"])
+portfolio = st.selectbox("📁 Portefeuille", ["ETF", "CROISSANCE", "RISQUE"])
 
-# ---------- ACHAT / VENTE ----------
 st.subheader("➕ Achat / Vente")
 
 c1, c2, c3 = st.columns(3)
 
 with c1:
     ticker = st.text_input("Ticker")
-    market = st.selectbox("Marché", ["US","CA"])
-    action = st.selectbox("Action", ["BUY","SELL"])
-    price_mode = st.selectbox("Prix utilisé", ["Open","Close"])
+    market = st.selectbox("Marché", ["US", "CA"])
+    action = st.selectbox("Action", ["BUY", "SELL"])
+    price_mode = st.selectbox("Prix utilisé", ["Open", "Close"])
 
 with c2:
     tx_date = st.date_input("Date", value=date.today())
     montant = st.number_input("Montant $", min_value=0.0)
 
 with c3:
-    rounding = st.selectbox("Arrondi", ["Entier","2 décimales"])
+    rounding = st.selectbox("Arrondi", ["Entier", "2 décimales"])
 
 ohlc = get_ohlc(ticker, market, tx_date) if ticker else None
 if ohlc:
@@ -181,8 +195,8 @@ currency = "USD" if market == "US" else "CAD"
 
 # ----- VALIDATION SELL -----
 if action == "SELL":
-    pos, _ = load_positions(portfolio)
-    held = pos.loc[pos["ticker"]==normalize_ticker(ticker, market),"quantity"]
+    pos_check, _ = load_positions(portfolio)
+    held = pos_check.loc[pos_check["ticker"] == normalize_ticker(ticker, market), "quantity"]
     max_qty = float(held.iloc[0]) if not held.empty else 0.0
     st.info(f"Quantité détenue : {max_qty:.2f}")
     if qty > max_qty:
@@ -222,7 +236,7 @@ if not pos.empty:
 
     st.metric("Valeur totale (CAD)", f"{total_value:,.2f}")
     st.metric("Rendement total", f"{total_return:.2f} %")
-    st.metric("CAGR", f"{cagr*100:.2f} %")
+    st.metric("CAGR", f"{cagr * 100:.2f} %")
 
     st.dataframe(
         pos.style.format({
