@@ -143,18 +143,16 @@ def load_positions(portfolio):
 
     return pos, df
 
-# ================= METRICS (SÉCURISÉ) =================
+# ================= METRICS =================
 def portfolio_metrics(pos, df):
     total_value = pos["Valeur (CAD)"].sum()
     total_cost = pos["Coût (CAD)"].sum()
 
-    # Rendement total
     if total_cost > 0:
         total_return = (total_value / total_cost - 1) * 100
     else:
         total_return = 0.0
 
-    # CAGR sécurisé
     start_date = pd.to_datetime(df["date"]).min()
     years = (pd.Timestamp.today() - start_date).days / 365.25
 
@@ -216,7 +214,7 @@ if action == "SELL":
         st.error("Quantité de vente supérieure à la position détenue.")
         st.stop()
 
-# INSERT ROBUSTE
+# INSERT
 if st.button("💾 Enregistrer"):
     c.execute(
         """
@@ -251,8 +249,11 @@ if not pos.empty:
     st.metric("Rendement total", f"{total_return:.2f} %")
     st.metric("CAGR", f"{cagr * 100:.2f} %")
 
+    # 🔒 SAFE DISPLAY (évite crash Styler)
+    display_pos = pos.fillna(0)
+
     st.dataframe(
-        pos.style.format({
+        display_pos.style.format({
             "quantity": "{:.2f}",
             "avg_price": "{:.2f}",
             "Prix actuel": "{:.2f}",
@@ -279,3 +280,4 @@ journal = pd.read_sql(
 )
 
 st.dataframe(journal)
+
