@@ -86,11 +86,11 @@ def get_last_closes_ca(tickers):
 # ================= POSITIONS =================
 def load_positions(portfolio):
     df = pd.read_sql(
-        "SELECT * FROM transactions WHERE portfolio=? AND action IN ('BUY','SELL')",
+        "SELECT * FROM transactions WHERE portfolio=?",
         conn, params=(portfolio,)
     )
     if df.empty:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), df
 
     df["signed"] = np.where(df["action"]=="BUY", df["quantity"], -df["quantity"])
 
@@ -107,11 +107,7 @@ def load_positions(portfolio):
     prices, values, costs = [], [], []
 
     for _, r in pos.iterrows():
-        if r.market == "CA":
-            price = ca_prices.get(r.ticker)
-        else:
-            price = get_last_close_us(r.ticker)
-
+        price = ca_prices.get(r.ticker) if r.market=="CA" else get_last_close_us(r.ticker)
         prices.append(price)
 
         if price is not None:
@@ -149,6 +145,7 @@ st.title("📊 Portfolio Tracker")
 
 portfolio = st.selectbox("📁 Portefeuille", ["ETF","CROISSANCE","RISQUE"])
 
+# ---------- ACHAT / VENTE ----------
 st.subheader("➕ Achat / Vente")
 
 c1, c2, c3 = st.columns(3)
@@ -156,6 +153,7 @@ c1, c2, c3 = st.columns(3)
 with c1:
     ticker = st.text_input("Ticker")
     market = st.selectbox("Marché", ["US","CA"])
+    action = st.selectbox("Action", ["BUY","SELL"])
     price_mode = st.selectbox("Prix utilisé", ["Open","Close"])
 
 with c2:
@@ -181,11 +179,34 @@ price = st.number_input("Prix exécuté", key="price")
 qty = st.number_input("Quantité", key="qty")
 currency = "USD" if market == "US" else "CAD"
 
+# ----- VALIDATION SELL -----
+if action == "SELL":
+    pos, _ = load_positions(portfolio)
+    held = pos.loc[pos["ticker"]==normalize_ticker(ticker, market),"quantity"]
+    max_qty = float(held.iloc[0]) if not held.empty else 0.0
+    st.info(f"Quantité détenue : {max_qty:.2f}")
+    if qty > max_qty:
+        st.error("Quantité de vente supérieure à la position détenue.")
+        st.stop()
+
+# ----- INSERT ROBUSTE -----
 if st.button("💾 Enregistrer"):
     c.execute(
-        "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?)",
-        (tx_date.strftime("%Y-%m-%d"), portfolio, normalize_ticker(ticker, market),
-         market, "BUY", qty, price, currency)
+        """
+        INSERT INTO transactions
+        (date, portfolio, ticker, market, action, quantity, price, currency)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            tx_date.strftime("%Y-%m-%d"),
+            portfolio,
+            normalize_ticker(ticker, market),
+            market,
+            action,
+            qty,
+            price,
+            currency
+        )
     )
     conn.commit()
     st.success("Transaction enregistrée")
@@ -215,14 +236,15 @@ if not pos.empty:
     )
 else:
     st.info("Aucune position dans ce portefeuille.")
+
 # ---------- JOURNAL ----------
 st.divider()
 st.subheader("📒 Journal des transactions")
 
 journal = pd.read_sql(
     """
-    SELECT rowid AS tx_id, date, portfolio, ticker, market, action,
-           quantity, price, currency
+    SELECT rowid AS tx_id, date, portfolio, ticker, market,
+           action, quantity, price, currency
     FROM transactions
     ORDER BY date DESC
     """,
