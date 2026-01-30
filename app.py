@@ -10,7 +10,7 @@ import numpy as np
 DB_NAME = "portfolio.db"
 POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 
-st.set_page_config(page_title="📊 Portfolio Tracker + Benchmark", layout="wide")
+st.set_page_config(page_title="📊 Portfolio Tracker", layout="wide")
 
 # ================= DB =================
 conn = sqlite3.connect(DB_NAME, check_same_thread=False)
@@ -37,7 +37,7 @@ def fx_rate():
         df = yf.download("USDCAD=X", period="5d", progress=False)
         return float(df["Close"].dropna().iloc[-1])
     except Exception:
-        return 1.35  # fallback
+        return 1.35
 
 FX = fx_rate()
 
@@ -65,7 +65,7 @@ def get_ohlc(ticker, market, d):
         r = df.iloc[0]
         return {"Open": float(r["Open"]), "Close": float(r["Close"])}
 
-# ================= PRIX ACTUELS =================
+# ================= PRIX =================
 @st.cache_data(ttl=900)
 def get_last_close_us(ticker):
     url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?apiKey={POLYGON_KEY}"
@@ -146,13 +146,12 @@ def load_positions(portfolio):
 def portfolio_metrics(pos, df):
     total_value = pos["Valeur (CAD)"].sum()
     total_cost = pos["Coût (CAD)"].sum()
-
     total_return = (total_value / total_cost - 1) * 100 if total_cost > 0 else 0.0
 
     start_date = pd.to_datetime(df["date"]).min()
     years = (pd.Timestamp.today() - start_date).days / 365.25
-
     cagr = (total_value / total_cost) ** (1 / years) - 1 if total_cost > 0 and years > 0 else 0.0
+
     return total_value, total_return, cagr
 
 # ================= BENCHMARK =================
@@ -166,14 +165,66 @@ def load_benchmark(symbol, start):
     return df
 
 # ================= UI =================
-st.title("📊 Portfolio Tracker + Benchmark")
+st.title("📊 Portfolio Tracker")
 
 portfolio = st.selectbox("📁 Portefeuille", ["ETF", "CROISSANCE", "RISQUE"])
 
-tab1, tab2, tab3 = st.tabs(["📦 Composition", "📈 Benchmark", "📒 Journal"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["➕ Achat / Vente", "📦 Composition", "📈 Benchmark", "📒 Journal"]
+)
 
-# ---------- TAB 1 : COMPOSITION ----------
+# ---------- TAB 1 : ACHAT / VENTE ----------
 with tab1:
+    st.subheader("➕ Achat / Vente")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        ticker = st.text_input("Ticker")
+        market = st.selectbox("Marché", ["US", "CA"])
+        action = st.selectbox("Action", ["BUY", "SELL"])
+        price_mode = st.selectbox("Prix utilisé", ["Open", "Close"])
+
+    with c2:
+        tx_date = st.date_input("Date", value=date.today())
+        montant = st.number_input("Montant $", min_value=0.0)
+
+    with c3:
+        rounding = st.selectbox("Arrondi", ["Entier", "2 décimales"])
+
+    ohlc = get_ohlc(ticker, market, tx_date)
+    if ohlc:
+        st.info(f"Open : {ohlc['Open']:.2f} | Close : {ohlc['Close']:.2f}")
+
+    ref_price = ohlc[price_mode] if ohlc else None
+    if st.button("⚡ Calculer quantité") and ref_price and montant > 0:
+        q = montant / ref_price
+        q = int(q) if rounding == "Entier" else round(q, 2)
+        st.session_state.qty = q
+        st.session_state.price = round(ref_price, 2)
+
+    price = st.number_input("Prix exécuté", key="price")
+    qty = st.number_input("Quantité", key="qty")
+    currency = "USD" if market == "US" else "CAD"
+
+    if st.button("💾 Enregistrer transaction"):
+        c.execute(
+            "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?)",
+            (
+                tx_date.strftime("%Y-%m-%d"),
+                portfolio,
+                normalize_ticker(ticker, market),
+                market,
+                action,
+                qty,
+                price,
+                currency,
+            ),
+        )
+        conn.commit()
+        st.success("Transaction enregistrée")
+
+# ---------- TAB 2 : COMPOSITION ----------
+with tab2:
     pos, df_port = load_positions(portfolio)
 
     if not pos.empty:
@@ -181,7 +232,7 @@ with tab1:
 
         st.metric("Valeur totale (CAD)", f"{total_value:,.2f}")
         st.metric("Rendement total", f"{total_return:.2f} %")
-        st.metric("CAGR", f"{cagr*100:.2f} %")
+        st.metric("CAGR", f"{cagr * 100:.2f} %")
 
         st.dataframe(
             pos.fillna(0).style.format({
@@ -196,38 +247,22 @@ with tab1:
     else:
         st.info("Aucune position.")
 
-# ---------- TAB 2 : BENCHMARK ----------
-with tab2:
+# ---------- TAB 3 : BENCHMARK ----------
+with tab3:
     if df_port.empty:
         st.info("Aucune donnée pour le benchmark.")
     else:
         start = pd.to_datetime(df_port["date"]).min()
-
         bench_us = load_benchmark("^GSPC", start)
         bench_ca = load_benchmark("^GSPTSE", start)
 
-        total_value, _, _ = portfolio_metrics(pos, df_port)
-
-        # portefeuille normalisé
-        port_series = (
-            df_port.groupby("date")["price"]
-            .sum()
-            .sort_index()
-        )
-        port_norm = port_series / port_series.iloc[0]
-
-        df_plot = pd.DataFrame({"Portefeuille": port_norm})
-
         if bench_us is not None:
-            df_plot["S&P 500"] = bench_us["Norm"]
-
+            st.line_chart(bench_us["Norm"], height=300)
         if bench_ca is not None:
-            df_plot["TSX"] = bench_ca["Norm"]
+            st.line_chart(bench_ca["Norm"], height=300)
 
-        st.line_chart(df_plot)
-
-# ---------- TAB 3 : JOURNAL ----------
-with tab3:
+# ---------- TAB 4 : JOURNAL ----------
+with tab4:
     journal = pd.read_sql(
         """
         SELECT rowid AS id, date, portfolio, ticker, market,
@@ -237,8 +272,4 @@ with tab3:
         """,
         conn
     )
-
-    if journal.empty:
-        st.info("Aucune transaction.")
-    else:
-        st.dataframe(journal)
+    st.dataframe(journal)
