@@ -252,4 +252,30 @@ with tab3:
         conn
     )
 
-    st.dataframe(journal)
+    if journal.empty:
+        st.info("Aucune transaction.")
+    else:
+        st.dataframe(journal)
+
+        st.divider()
+        st.subheader("🗑️ Supprimer une transaction")
+
+        tx_id = st.selectbox("Transaction à supprimer (ID)", journal["id"])
+        tx_row = journal[journal["id"] == tx_id].iloc[0]
+
+        st.warning(
+            f"""
+            **Date** : {tx_row['date']}  
+            **Portefeuille** : {tx_row['portfolio']}  
+            **Ticker** : {tx_row['ticker']}  
+            **Action** : {tx_row['action']}  
+            **Quantité** : {tx_row['quantity']}  
+            **Prix** : {tx_row['price']} {tx_row['currency']}
+            """
+        )
+
+        if st.button("❌ Supprimer définitivement"):
+            c.execute("DELETE FROM transactions WHERE rowid = ?", (int(tx_id),))
+            conn.commit()
+            st.success("Transaction supprimée.")
+            st.experimental_rerun()
