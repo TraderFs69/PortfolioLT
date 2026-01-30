@@ -72,17 +72,11 @@ def get_last_closes_ca(tickers):
     if not tickers:
         return {}
 
-    tickers = list(set(tickers))  # sécurité
-    data = yf.download(
-        tickers=tickers,
-        period="5d",
-        auto_adjust=False,
-        progress=False
-    )
+    tickers = list(set(tickers))
+    data = yf.download(tickers=tickers, period="5d", progress=False)
 
     prices = {}
 
-    # ---- CAS 1 TICKER ----
     if len(tickers) == 1:
         try:
             prices[tickers[0]] = float(data["Close"].dropna().iloc[-1])
@@ -90,16 +84,11 @@ def get_last_closes_ca(tickers):
             prices[tickers[0]] = None
         return prices
 
-    # ---- CAS PLUSIEURS TICKERS (MultiIndex) ----
-    try:
-        close_df = data["Close"]
-        for t in tickers:
-            try:
-                prices[t] = float(close_df[t].dropna().iloc[-1])
-            except Exception:
-                prices[t] = None
-    except Exception:
-        for t in tickers:
+    close_df = data["Close"]
+    for t in tickers:
+        try:
+            prices[t] = float(close_df[t].dropna().iloc[-1])
+        except Exception:
             prices[t] = None
 
     return prices
@@ -153,38 +142,114 @@ def load_positions(portfolio):
 def portfolio_metrics(pos, df):
     total_value = pos["Valeur (CAD)"].sum()
     total_cost = pos["Coût (CAD)"].sum()
-
     total_return = (total_value / total_cost - 1) * 100 if total_cost > 0 else 0.0
 
     start_date = pd.to_datetime(df["date"]).min()
     years = (pd.Timestamp.today() - start_date).days / 365.25
-
     cagr = (total_value / total_cost) ** (1 / years) - 1 if total_cost > 0 and years > 0 else 0.0
+
     return total_value, total_return, cagr
 
 # ================= UI =================
 st.title("📊 Portfolio Tracker")
 portfolio = st.selectbox("📁 Portefeuille", ["ETF", "CROISSANCE", "RISQUE"])
 
-st.subheader("📦 Composition")
-pos, df_port = load_positions(portfolio)
+tab1, tab2, tab3 = st.tabs(["➕ Achat / Vente", "📦 Composition", "📒 Journal"])
 
-if not pos.empty:
-    total_value, total_return, cagr = portfolio_metrics(pos, df_port)
-    st.metric("Valeur totale (CAD)", f"{total_value:,.2f}")
-    st.metric("Rendement total", f"{total_return:.2f} %")
-    st.metric("CAGR", f"{cagr*100:.2f} %")
+# ---------- TAB 1 : ACHAT / VENTE ----------
+with tab1:
+    st.subheader("➕ Achat / Vente")
 
-    display_pos = pos.fillna(0)
-    st.dataframe(
-        display_pos.style.format({
-            "quantity": "{:.2f}",
-            "avg_price": "{:.2f}",
-            "Prix actuel": "{:.2f}",
-            "Valeur (CAD)": "{:,.2f}",
-            "Coût (CAD)": "{:,.2f}",
-            "Gain %": "{:.2f}%"
-        })
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        ticker = st.text_input("Ticker")
+        market = st.selectbox("Marché", ["US", "CA"])
+        action = st.selectbox("Action", ["BUY", "SELL"])
+        price_mode = st.selectbox("Prix utilisé", ["Open", "Close"])
+
+    with c2:
+        tx_date = st.date_input("Date", value=date.today())
+        montant = st.number_input("Montant $", min_value=0.0)
+
+    with c3:
+        rounding = st.selectbox("Arrondi", ["Entier", "2 décimales"])
+
+    ohlc = get_ohlc(ticker, market, tx_date) if ticker else None
+    if ohlc:
+        st.info(f"Open : {ohlc['Open']:.2f} | Close : {ohlc['Close']:.2f}")
+
+    ref_price = ohlc[price_mode] if ohlc else None
+
+    if st.button("⚡ Calculer quantité") and ref_price and montant > 0:
+        qty_calc = montant / ref_price
+        qty_calc = int(qty_calc) if rounding == "Entier" else round(qty_calc, 2)
+        st.session_state.qty = qty_calc
+        st.session_state.price = round(ref_price, 2)
+
+    price = st.number_input("Prix exécuté", key="price")
+    qty = st.number_input("Quantité", key="qty")
+    currency = "USD" if market == "US" else "CAD"
+
+    if st.button("💾 Enregistrer transaction"):
+        c.execute(
+            """
+            INSERT INTO transactions
+            (date, portfolio, ticker, market, action, quantity, price, currency)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tx_date.strftime("%Y-%m-%d"),
+                portfolio,
+                normalize_ticker(ticker, market),
+                market,
+                action,
+                qty,
+                price,
+                currency
+            )
+        )
+        conn.commit()
+        st.success("Transaction enregistrée")
+
+# ---------- TAB 2 : COMPOSITION ----------
+with tab2:
+    st.subheader(f"📦 Composition {portfolio}")
+
+    pos, df_port = load_positions(portfolio)
+
+    if not pos.empty:
+        total_value, total_return, cagr = portfolio_metrics(pos, df_port)
+
+        st.metric("Valeur totale (CAD)", f"{total_value:,.2f}")
+        st.metric("Rendement total", f"{total_return:.2f} %")
+        st.metric("CAGR", f"{cagr * 100:.2f} %")
+
+        st.dataframe(
+            pos.fillna(0).style.format({
+                "quantity": "{:.2f}",
+                "avg_price": "{:.2f}",
+                "Prix actuel": "{:.2f}",
+                "Valeur (CAD)": "{:,.2f}",
+                "Coût (CAD)": "{:,.2f}",
+                "Gain %": "{:.2f}%"
+            })
+        )
+    else:
+        st.info("Aucune position dans ce portefeuille.")
+
+# ---------- TAB 3 : JOURNAL ----------
+with tab3:
+    st.subheader("📒 Journal des transactions")
+
+    journal = pd.read_sql(
+        """
+        SELECT rowid AS id, date, portfolio, ticker, market,
+               action, quantity, price, currency
+        FROM transactions
+        ORDER BY date DESC
+        """,
+        conn
     )
-else:
-    st.info("Aucune position dans ce portefeuille.")
+
+    st.dataframe(journal)
