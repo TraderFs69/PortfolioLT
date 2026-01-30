@@ -44,6 +44,8 @@ FX = fx_rate()
 
 # ================= OHLC =================
 def get_ohlc(ticker, market, d):
+    if not ticker:
+        return None
     if market == "US":
         url = f"https://api.polygon.io/v1/open-close/{ticker}/{d}?adjusted=true&apiKey={POLYGON_KEY}"
         r = requests.get(url).json()
@@ -51,8 +53,8 @@ def get_ohlc(ticker, market, d):
             return None
         return {"Open": r["open"], "Close": r["close"]}
     else:
-        ticker = normalize_ticker(ticker, "CA")
-        df = yf.download(ticker, start=d, end=d + timedelta(days=1), progress=False)
+        t = normalize_ticker(ticker, "CA")
+        df = yf.download(t, start=d, end=d + timedelta(days=1), progress=False)
         if df.empty:
             return None
         r = df.iloc[0]
@@ -76,7 +78,7 @@ def get_last_closes_ca(tickers):
     data = yf.download(tickers=tickers, period="5d", progress=False)
 
     prices = {}
-
+    # 1 ticker
     if len(tickers) == 1:
         try:
             prices[tickers[0]] = float(data["Close"].dropna().iloc[-1])
@@ -84,11 +86,16 @@ def get_last_closes_ca(tickers):
             prices[tickers[0]] = None
         return prices
 
-    close_df = data["Close"]
-    for t in tickers:
-        try:
-            prices[t] = float(close_df[t].dropna().iloc[-1])
-        except Exception:
+    # plusieurs tickers (MultiIndex)
+    try:
+        close_df = data["Close"]
+        for t in tickers:
+            try:
+                prices[t] = float(close_df[t].dropna().iloc[-1])
+            except Exception:
+                prices[t] = None
+    except Exception:
+        for t in tickers:
             prices[t] = None
 
     return prices
@@ -111,7 +118,7 @@ def load_positions(portfolio):
 
     pos = pos[pos["quantity"] > 0]
 
-    ca_tickers = pos[pos["market"] == "CA"]["ticker"].tolist()
+    ca_tickers = pos.loc[pos["market"] == "CA", "ticker"].tolist()
     ca_prices = get_last_closes_ca(ca_tickers)
 
     prices, values, costs = [], [], []
@@ -161,35 +168,44 @@ with tab1:
     st.subheader("➕ Achat / Vente")
 
     c1, c2, c3 = st.columns(3)
-
     with c1:
         ticker = st.text_input("Ticker")
         market = st.selectbox("Marché", ["US", "CA"])
         action = st.selectbox("Action", ["BUY", "SELL"])
         price_mode = st.selectbox("Prix utilisé", ["Open", "Close"])
-
     with c2:
         tx_date = st.date_input("Date", value=date.today())
         montant = st.number_input("Montant $", min_value=0.0)
-
     with c3:
         rounding = st.selectbox("Arrondi", ["Entier", "2 décimales"])
 
-    ohlc = get_ohlc(ticker, market, tx_date) if ticker else None
+    ohlc = get_ohlc(ticker, market, tx_date)
     if ohlc:
         st.info(f"Open : {ohlc['Open']:.2f} | Close : {ohlc['Close']:.2f}")
 
     ref_price = ohlc[price_mode] if ohlc else None
-
     if st.button("⚡ Calculer quantité") and ref_price and montant > 0:
-        qty_calc = montant / ref_price
-        qty_calc = int(qty_calc) if rounding == "Entier" else round(qty_calc, 2)
-        st.session_state.qty = qty_calc
+        q = montant / ref_price
+        q = int(q) if rounding == "Entier" else round(q, 2)
+        st.session_state.qty = q
         st.session_state.price = round(ref_price, 2)
 
     price = st.number_input("Prix exécuté", key="price")
     qty = st.number_input("Quantité", key="qty")
     currency = "USD" if market == "US" else "CAD"
+
+    # Sécurité SELL
+    if action == "SELL":
+        pos_chk, _ = load_positions(portfolio)
+        held = pos_chk.loc[
+            pos_chk["ticker"] == normalize_ticker(ticker, market),
+            "quantity"
+        ]
+        max_qty = float(held.iloc[0]) if not held.empty else 0.0
+        st.info(f"Quantité détenue : {max_qty:.2f}")
+        if qty > max_qty:
+            st.error("Quantité de vente supérieure à la position détenue.")
+            st.stop()
 
     if st.button("💾 Enregistrer transaction"):
         c.execute(
@@ -217,13 +233,11 @@ with tab2:
     st.subheader(f"📦 Composition {portfolio}")
 
     pos, df_port = load_positions(portfolio)
-
     if not pos.empty:
         total_value, total_return, cagr = portfolio_metrics(pos, df_port)
-
         st.metric("Valeur totale (CAD)", f"{total_value:,.2f}")
         st.metric("Rendement total", f"{total_return:.2f} %")
-        st.metric("CAGR", f"{cagr * 100:.2f} %")
+        st.metric("CAGR", f"{cagr*100:.2f} %")
 
         st.dataframe(
             pos.fillna(0).style.format({
@@ -278,4 +292,5 @@ with tab3:
             c.execute("DELETE FROM transactions WHERE rowid = ?", (int(tx_id),))
             conn.commit()
             st.success("Transaction supprimée.")
-            st.experimental_rerun()
+            st.rerun()
+
