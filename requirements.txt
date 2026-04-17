@@ -1,5 +1,6 @@
 streamlit
-yfinance
 pandas
 numpy
-fpdf2
+psycopg2-binary
+requests
+yfinance
