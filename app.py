@@ -10,10 +10,13 @@ st.set_page_config(page_title="📊 TEA Portfolio", layout="wide")
 
 POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 
-# ================= DB =================
+# ================= DB CONNECTION =================
 @st.cache_resource
 def get_conn():
-    return psycopg2.connect(st.secrets["SUPABASE_DB_URL"])
+    return psycopg2.connect(
+        st.secrets["SUPABASE_DB_URL"],
+        sslmode="require"  # 🔥 IMPORTANT pour Supabase
+    )
 
 conn = get_conn()
 
@@ -54,49 +57,69 @@ CREATE TABLE IF NOT EXISTS history (
 # ================= PRIX =================
 @st.cache_data(ttl=60)
 def get_price(ticker):
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?apiKey={POLYGON_KEY}"
-    r = requests.get(url).json()
-    if "results" in r:
-        return r["results"][0]["c"]
+    try:
+        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?apiKey={POLYGON_KEY}"
+        r = requests.get(url).json()
+        if "results" in r:
+            return r["results"][0]["c"]
+    except:
+        return None
     return None
 
-# ================= PORTFOLIOS =================
+# ================= SIDEBAR =================
 st.sidebar.title("📁 STRATÉGIES")
 
 ports = pd.read_sql("SELECT name FROM portfolios", conn)["name"].tolist()
 
 new_port = st.sidebar.text_input("➕ Nouvelle stratégie")
 
-if st.sidebar.button("Créer"):
+if st.sidebar.button("Créer stratégie"):
     if new_port:
-        run_query("INSERT INTO portfolios VALUES (%s) ON CONFLICT DO NOTHING", (new_port,))
+        run_query(
+            "INSERT INTO portfolios (name) VALUES (%s) ON CONFLICT DO NOTHING",
+            (new_port,)
+        )
         st.rerun()
 
-portfolio = st.sidebar.selectbox("Choisir", ports)
+if ports:
+    portfolio = st.sidebar.selectbox("Choisir", ports)
+else:
+    st.warning("Crée un portefeuille pour commencer")
+    st.stop()
 
-# ================= TRANSACTIONS =================
-st.title("📊 TEA Portfolio")
+# ================= UI =================
+st.title("📊 TEA Portfolio Tracker")
 
 col1, col2 = st.columns(2)
 
 with col1:
     ticker = st.text_input("Ticker")
     action = st.selectbox("Action", ["BUY", "SELL"])
-    price = st.number_input("Prix")
+    price = st.number_input("Prix", min_value=0.0)
 
 with col2:
-    qty = st.number_input("Quantité")
+    qty = st.number_input("Quantité", min_value=0.0)
     tx_date = st.date_input("Date", value=date.today())
 
 if st.button("💾 Ajouter transaction"):
-    run_query(
-        "INSERT INTO transactions (date, portfolio, ticker, action, quantity, price) VALUES (%s,%s,%s,%s,%s,%s)",
-        (tx_date, portfolio, ticker.upper(), action, qty, price)
-    )
-    st.success("Ajouté")
+    if ticker and qty > 0 and price > 0:
+        run_query(
+            """INSERT INTO transactions 
+            (date, portfolio, ticker, action, quantity, price)
+            VALUES (%s,%s,%s,%s,%s,%s)""",
+            (tx_date, portfolio, ticker.upper(), action, qty, price)
+        )
+        st.success("Transaction ajoutée")
+        st.rerun()
+    else:
+        st.error("Entrée invalide")
 
-# ================= POSITIONS =================
-df = pd.read_sql("SELECT * FROM transactions WHERE portfolio=%s", conn, params=(portfolio,))
+# ================= LOAD DATA =================
+df = pd.read_sql(
+    "SELECT * FROM transactions WHERE portfolio=%s",
+    conn,
+    params=(portfolio,)
+)
 
 if not df.empty:
 
@@ -118,22 +141,34 @@ if not df.empty:
         p = get_price(r.ticker)
         prices.append(p)
 
-        val = p * r.quantity if p else None
+        if p:
+            val = p * r.quantity
+        else:
+            val = None
+
         values.append(val)
 
     pos["Prix"] = prices
     pos["Valeur"] = values
-    pos["Gain %"] = (pos["Valeur"] - pos["total_cost"]) / pos["total_cost"] * 100
+
+    pos["Gain %"] = (
+        (pos["Valeur"] - pos["total_cost"]) / pos["total_cost"]
+    ) * 100
+
     pos["Poids %"] = pos["Valeur"] / pos["Valeur"].sum() * 100
 
     # ================= METRICS =================
     total_value = pos["Valeur"].sum()
     total_cost = pos["total_cost"].sum()
-    total_return = (total_value / total_cost - 1) * 100 if total_cost > 0 else 0
+
+    total_return = (
+        (total_value / total_cost - 1) * 100
+        if total_cost > 0 else 0
+    )
 
     colA, colB = st.columns(2)
-    colA.metric("💰 Valeur", f"{total_value:,.0f}$")
-    colB.metric("📈 Rendement", f"{total_return:.2f}%")
+    colA.metric("💰 Valeur", f"{total_value:,.0f} $")
+    colB.metric("📈 Rendement", f"{total_return:.2f} %")
 
     # ================= SAVE HISTORY =================
     today = date.today()
@@ -146,14 +181,17 @@ if not df.empty:
 
     if not exists:
         run_query(
-            "INSERT INTO history VALUES (%s,%s,%s)",
+            "INSERT INTO history (date, portfolio, value) VALUES (%s,%s,%s)",
             (today, portfolio, total_value)
         )
 
     # ================= TABLE =================
+    st.subheader("📦 Positions")
     st.dataframe(pos)
 
     # ================= GRAPH =================
+    st.subheader("📈 Évolution")
+
     hist = pd.read_sql(
         "SELECT * FROM history WHERE portfolio=%s ORDER BY date",
         conn,
@@ -165,4 +203,4 @@ if not df.empty:
         st.line_chart(hist.set_index("date")["value"])
 
 else:
-    st.info("Aucune donnée")
+    st.info("Aucune transaction pour ce portefeuille")
