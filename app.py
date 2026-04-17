@@ -1,275 +1,168 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
-import yfinance as yf
+import psycopg2
 import requests
-from datetime import date, timedelta
 import numpy as np
+from datetime import date
 
 # ================= CONFIG =================
-DB_NAME = "portfolio.db"
+st.set_page_config(page_title="📊 TEA Portfolio", layout="wide")
+
 POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 
-st.set_page_config(page_title="📊 Portfolio Tracker", layout="wide")
-
 # ================= DB =================
-conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-c = conn.cursor()
+@st.cache_resource
+def get_conn():
+    return psycopg2.connect(st.secrets["SUPABASE_DB_URL"])
 
-c.execute("""
-CREATE TABLE IF NOT EXISTS transactions (
-    date TEXT,
-    portfolio TEXT,
-    ticker TEXT,
-    market TEXT,
-    action TEXT,
-    quantity REAL,
-    price REAL,
-    currency TEXT
+conn = get_conn()
+
+def run_query(query, params=None, fetch=False):
+    with conn.cursor() as c:
+        c.execute(query, params)
+        if fetch:
+            return c.fetchall()
+        conn.commit()
+
+# ================= INIT TABLES =================
+run_query("""
+CREATE TABLE IF NOT EXISTS portfolios (
+    name TEXT PRIMARY KEY
 )
 """)
-conn.commit()
 
-# ================= FX =================
-@st.cache_data(ttl=3600)
-def fx_rate():
-    try:
-        df = yf.download("USDCAD=X", period="5d", progress=False)
-        return float(df["Close"].dropna().iloc[-1])
-    except Exception:
-        return 1.35
+run_query("""
+CREATE TABLE IF NOT EXISTS transactions (
+    id SERIAL PRIMARY KEY,
+    date DATE,
+    portfolio TEXT,
+    ticker TEXT,
+    action TEXT,
+    quantity FLOAT,
+    price FLOAT
+)
+""")
 
-FX = fx_rate()
-
-# ================= HELPERS =================
-def normalize_ticker(ticker, market):
-    if market == "CA" and not ticker.upper().endswith(".TO"):
-        return ticker.upper() + ".TO"
-    return ticker.upper()
-
-# ================= OHLC =================
-def get_ohlc(ticker, market, d):
-    if not ticker:
-        return None
-    if market == "US":
-        url = f"https://api.polygon.io/v1/open-close/{ticker}/{d}?adjusted=true&apiKey={POLYGON_KEY}"
-        r = requests.get(url).json()
-        if r.get("status") != "OK":
-            return None
-        return {"Open": r["open"], "Close": r["close"]}
-    else:
-        t = normalize_ticker(ticker, "CA")
-        df = yf.download(t, start=d, end=d + timedelta(days=1), progress=False)
-        if df.empty:
-            return None
-        r = df.iloc[0]
-        return {"Open": float(r["Open"]), "Close": float(r["Close"])}
+run_query("""
+CREATE TABLE IF NOT EXISTS history (
+    date DATE,
+    portfolio TEXT,
+    value FLOAT
+)
+""")
 
 # ================= PRIX =================
-@st.cache_data(ttl=900)
-def get_last_close_us(ticker):
+@st.cache_data(ttl=60)
+def get_price(ticker):
     url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?apiKey={POLYGON_KEY}"
     r = requests.get(url).json()
     if "results" in r:
         return r["results"][0]["c"]
     return None
 
-@st.cache_data(ttl=900)
-def get_last_closes_ca(tickers):
-    if not tickers:
-        return {}
-    tickers = list(set(tickers))
-    data = yf.download(tickers=tickers, period="5d", progress=False)
-    prices = {}
+# ================= PORTFOLIOS =================
+st.sidebar.title("📁 STRATÉGIES")
 
-    if len(tickers) == 1:
-        try:
-            prices[tickers[0]] = float(data["Close"].dropna().iloc[-1])
-        except Exception:
-            prices[tickers[0]] = None
-        return prices
+ports = pd.read_sql("SELECT name FROM portfolios", conn)["name"].tolist()
 
-    close_df = data["Close"]
-    for t in tickers:
-        try:
-            prices[t] = float(close_df[t].dropna().iloc[-1])
-        except Exception:
-            prices[t] = None
-    return prices
+new_port = st.sidebar.text_input("➕ Nouvelle stratégie")
+
+if st.sidebar.button("Créer"):
+    if new_port:
+        run_query("INSERT INTO portfolios VALUES (%s) ON CONFLICT DO NOTHING", (new_port,))
+        st.rerun()
+
+portfolio = st.sidebar.selectbox("Choisir", ports)
+
+# ================= TRANSACTIONS =================
+st.title("📊 TEA Portfolio")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    ticker = st.text_input("Ticker")
+    action = st.selectbox("Action", ["BUY", "SELL"])
+    price = st.number_input("Prix")
+
+with col2:
+    qty = st.number_input("Quantité")
+    tx_date = st.date_input("Date", value=date.today())
+
+if st.button("💾 Ajouter transaction"):
+    run_query(
+        "INSERT INTO transactions (date, portfolio, ticker, action, quantity, price) VALUES (%s,%s,%s,%s,%s,%s)",
+        (tx_date, portfolio, ticker.upper(), action, qty, price)
+    )
+    st.success("Ajouté")
 
 # ================= POSITIONS =================
-def load_positions(portfolio):
-    df = pd.read_sql(
-        "SELECT * FROM transactions WHERE portfolio=?",
-        conn, params=(portfolio,)
-    )
-    if df.empty:
-        return pd.DataFrame(), df
+df = pd.read_sql("SELECT * FROM transactions WHERE portfolio=%s", conn, params=(portfolio,))
+
+if not df.empty:
 
     df["signed"] = np.where(df["action"] == "BUY", df["quantity"], -df["quantity"])
+    df["cost"] = df["price"] * df["quantity"]
 
-    pos = df.groupby(["ticker", "market", "currency"]).agg(
+    pos = df.groupby("ticker").agg(
         quantity=("signed", "sum"),
-        avg_price=("price", "mean")
+        total_cost=("cost", "sum")
     ).reset_index()
 
     pos = pos[pos["quantity"] > 0]
 
-    ca_tickers = pos.loc[pos["market"] == "CA", "ticker"].tolist()
-    ca_prices = get_last_closes_ca(ca_tickers)
+    pos["avg_price"] = pos["total_cost"] / pos["quantity"]
 
-    prices, values, costs = [], [], []
+    prices, values = [], []
 
     for _, r in pos.iterrows():
-        price = ca_prices.get(r.ticker) if r.market == "CA" else get_last_close_us(r.ticker)
-        prices.append(price)
+        p = get_price(r.ticker)
+        prices.append(p)
 
-        if price:
-            val = price * r.quantity
-            val_cad = val if r.currency == "CAD" else val * FX
-            cost = r.avg_price * r.quantity
-            cost_cad = cost if r.currency == "CAD" else cost * FX
-        else:
-            val_cad, cost_cad = None, None
+        val = p * r.quantity if p else None
+        values.append(val)
 
-        values.append(val_cad)
-        costs.append(cost_cad)
+    pos["Prix"] = prices
+    pos["Valeur"] = values
+    pos["Gain %"] = (pos["Valeur"] - pos["total_cost"]) / pos["total_cost"] * 100
+    pos["Poids %"] = pos["Valeur"] / pos["Valeur"].sum() * 100
 
-    pos["Prix actuel"] = prices
-    pos["Valeur (CAD)"] = values
-    pos["Coût (CAD)"] = costs
-    pos["Gain %"] = (pos["Valeur (CAD)"] - pos["Coût (CAD)"]) / pos["Coût (CAD)"] * 100
+    # ================= METRICS =================
+    total_value = pos["Valeur"].sum()
+    total_cost = pos["total_cost"].sum()
+    total_return = (total_value / total_cost - 1) * 100 if total_cost > 0 else 0
 
-    return pos, df
+    colA, colB = st.columns(2)
+    colA.metric("💰 Valeur", f"{total_value:,.0f}$")
+    colB.metric("📈 Rendement", f"{total_return:.2f}%")
 
-# ================= METRICS =================
-def portfolio_metrics(pos, df):
-    total_value = pos["Valeur (CAD)"].sum()
-    total_cost = pos["Coût (CAD)"].sum()
-    total_return = (total_value / total_cost - 1) * 100 if total_cost > 0 else 0.0
+    # ================= SAVE HISTORY =================
+    today = date.today()
 
-    start_date = pd.to_datetime(df["date"]).min()
-    years = (pd.Timestamp.today() - start_date).days / 365.25
-    cagr = (total_value / total_cost) ** (1 / years) - 1 if total_cost > 0 and years > 0 else 0.0
-
-    return total_value, total_return, cagr
-
-# ================= BENCHMARK =================
-@st.cache_data(ttl=3600)
-def load_benchmark(symbol, start):
-    df = yf.download(symbol, start=start, progress=False)
-    if df.empty:
-        return None
-    df = df[["Close"]].dropna()
-    df["Norm"] = df["Close"] / df["Close"].iloc[0]
-    return df
-
-# ================= UI =================
-st.title("📊 Portfolio Tracker")
-
-portfolio = st.selectbox("📁 Portefeuille", ["ETF", "CROISSANCE", "RISQUE"])
-
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["➕ Achat / Vente", "📦 Composition", "📈 Benchmark", "📒 Journal"]
-)
-
-# ---------- TAB 1 : ACHAT / VENTE ----------
-with tab1:
-    st.subheader("➕ Achat / Vente")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        ticker = st.text_input("Ticker")
-        market = st.selectbox("Marché", ["US", "CA"])
-        action = st.selectbox("Action", ["BUY", "SELL"])
-        price_mode = st.selectbox("Prix utilisé", ["Open", "Close"])
-
-    with c2:
-        tx_date = st.date_input("Date", value=date.today())
-        montant = st.number_input("Montant $", min_value=0.0)
-
-    with c3:
-        rounding = st.selectbox("Arrondi", ["Entier", "2 décimales"])
-
-    ohlc = get_ohlc(ticker, market, tx_date)
-    if ohlc:
-        st.info(f"Open : {ohlc['Open']:.2f} | Close : {ohlc['Close']:.2f}")
-
-    ref_price = ohlc[price_mode] if ohlc else None
-    if st.button("⚡ Calculer quantité") and ref_price and montant > 0:
-        q = montant / ref_price
-        q = int(q) if rounding == "Entier" else round(q, 2)
-        st.session_state.qty = q
-        st.session_state.price = round(ref_price, 2)
-
-    price = st.number_input("Prix exécuté", key="price")
-    qty = st.number_input("Quantité", key="qty")
-    currency = "USD" if market == "US" else "CAD"
-
-    if st.button("💾 Enregistrer transaction"):
-        c.execute(
-            "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?)",
-            (
-                tx_date.strftime("%Y-%m-%d"),
-                portfolio,
-                normalize_ticker(ticker, market),
-                market,
-                action,
-                qty,
-                price,
-                currency,
-            ),
-        )
-        conn.commit()
-        st.success("Transaction enregistrée")
-
-# ---------- TAB 2 : COMPOSITION ----------
-with tab2:
-    pos, df_port = load_positions(portfolio)
-
-    if not pos.empty:
-        total_value, total_return, cagr = portfolio_metrics(pos, df_port)
-
-        st.metric("Valeur totale (CAD)", f"{total_value:,.2f}")
-        st.metric("Rendement total", f"{total_return:.2f} %")
-        st.metric("CAGR", f"{cagr * 100:.2f} %")
-
-        st.dataframe(
-            pos.fillna(0).style.format({
-                "quantity": "{:.2f}",
-                "avg_price": "{:.2f}",
-                "Prix actuel": "{:.2f}",
-                "Valeur (CAD)": "{:,.2f}",
-                "Coût (CAD)": "{:,.2f}",
-                "Gain %": "{:.2f}%"
-            })
-        )
-    else:
-        st.info("Aucune position.")
-
-# ---------- TAB 3 : BENCHMARK ----------
-with tab3:
-    if df_port.empty:
-        st.info("Aucune donnée pour le benchmark.")
-    else:
-        start = pd.to_datetime(df_port["date"]).min()
-        bench_us = load_benchmark("^GSPC", start)
-        bench_ca = load_benchmark("^GSPTSE", start)
-
-        if bench_us is not None:
-            st.line_chart(bench_us["Norm"], height=300)
-        if bench_ca is not None:
-            st.line_chart(bench_ca["Norm"], height=300)
-
-# ---------- TAB 4 : JOURNAL ----------
-with tab4:
-    journal = pd.read_sql(
-        """
-        SELECT rowid AS id, date, portfolio, ticker, market,
-               action, quantity, price, currency
-        FROM transactions
-        ORDER BY date DESC
-        """,
-        conn
+    exists = run_query(
+        "SELECT 1 FROM history WHERE date=%s AND portfolio=%s",
+        (today, portfolio),
+        fetch=True
     )
-    st.dataframe(journal)
+
+    if not exists:
+        run_query(
+            "INSERT INTO history VALUES (%s,%s,%s)",
+            (today, portfolio, total_value)
+        )
+
+    # ================= TABLE =================
+    st.dataframe(pos)
+
+    # ================= GRAPH =================
+    hist = pd.read_sql(
+        "SELECT * FROM history WHERE portfolio=%s ORDER BY date",
+        conn,
+        params=(portfolio,)
+    )
+
+    if not hist.empty:
+        hist["date"] = pd.to_datetime(hist["date"])
+        st.line_chart(hist.set_index("date")["value"])
+
+else:
+    st.info("Aucune donnée")
